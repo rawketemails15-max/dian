@@ -1,0 +1,19 @@
+# CCS build outputs
+**/Debug/
+**/Release/
+**/*.out
+**/*.map
+**/*.o
+**/*.obj
+**/*.d
+**/*.d_raw
+
+# Local IDE workspace state
+.metadata/
+.theia/
+
+# Local assistant/tooling state
+.agents/
+.claude/
+.codex/
+.mcp.json
