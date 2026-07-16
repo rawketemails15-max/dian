@@ -39,7 +39,7 @@
 #define KEY_DEBOUNCE_MS                 (40U)
 #define KEY_LONG_PRESS_MS               (1000U)
 
-#define MOTOR_PWM_PERIOD                (3000)
+#define MOTOR_PWM_PERIOD                (4000)
 #define MOTOR_PWM_CRUISE                (2300)
 
 /*
@@ -65,8 +65,8 @@
 #define LINE_MUX_SETTLE_US              (100U)
 #define LINE_MUX_SETTLE_CYCLES          \
     ((CPUCLK_FREQ / 1000000U) * LINE_MUX_SETTLE_US)
-#define LINE_PWM_GAIN_NUM               (3)
-#define LINE_PWM_GAIN_DEN               (2)
+#define LINE_ERROR_MAX                  (350)
+#define LINE_PWM_CORRECTION_MAX         (4000)
 #define LINE_CURVE_SLOWDOWN_NUM          (1)
 #define LINE_CURVE_SLOWDOWN_DEN          (1)
 /* Calibrated on the installed chassis: Motor A is right, Motor B is left. */
@@ -272,7 +272,7 @@ static void drive_line_follow_5ms(void)
 {
     int16_t error = line_error_from_mask(line_sensor_read_mask());
     int32_t pwmCorrection =
-        ((int32_t) error * LINE_PWM_GAIN_NUM) / LINE_PWM_GAIN_DEN;
+        ((int32_t) error * LINE_PWM_CORRECTION_MAX) / LINE_ERROR_MAX;
     int32_t correctionMagnitude =
         (pwmCorrection < 0) ? -pwmCorrection : pwmCorrection;
     int32_t basePwm = (int32_t) MOTOR_PWM_CRUISE -
