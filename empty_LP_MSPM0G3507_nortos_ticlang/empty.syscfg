@@ -22,6 +22,10 @@ const GPIO5  = GPIO.addInstance();
 const GPIO6  = GPIO.addInstance();
 const GPIO7  = GPIO.addInstance();
 const GPIO8  = GPIO.addInstance();
+const GPIO9  = GPIO.addInstance();
+const GPIO10 = GPIO.addInstance();
+const GPIO11 = GPIO.addInstance();
+const GPIO12 = GPIO.addInstance();
 const I2C    = scripting.addModule("/ti/driverlib/I2C", {}, false);
 const I2C1   = I2C.addInstance();
 const PWM    = scripting.addModule("/ti/driverlib/PWM", {}, false);
@@ -104,20 +108,40 @@ GPIO8.associatedPins[0].interruptEn = true;
 GPIO8.associatedPins[0].polarity    = "RISE";
 GPIO8.associatedPins[0].pin.$assign = "PA7";
 
+GPIO9.$name                          = "OLED_RST";
+GPIO9.associatedPins[0].$name        = "RST";
+GPIO9.associatedPins[0].initialValue = "SET";
+GPIO9.associatedPins[0].pin.$assign  = "PB14";
+
+GPIO10.$name                          = "OLED_DC";
+GPIO10.associatedPins[0].$name        = "DC";
+GPIO10.associatedPins[0].initialValue = "SET";
+GPIO10.associatedPins[0].pin.$assign  = "PB15";
+
+GPIO11.$name                          = "OLED_SCL";
+GPIO11.associatedPins[0].$name        = "SCL";
+GPIO11.associatedPins[0].initialValue = "SET";
+GPIO11.associatedPins[0].pin.$assign  = "PA28";
+
+GPIO12.$name                          = "OLED_SDA";
+GPIO12.associatedPins[0].$name        = "SDA";
+GPIO12.associatedPins[0].initialValue = "SET";
+GPIO12.associatedPins[0].pin.$assign  = "PA31";
+
 I2C1.$name                             = "I2C_IMU";
 I2C1.basicEnableController             = true;
 I2C1.basicControllerStandardBusSpeed   = "Fast";
 I2C1.peripheral.$assign                = "I2C0";
 I2C1.peripheral.sdaPin.$assign         = "PA0";
 I2C1.peripheral.sclPin.$assign         = "PA1";
-I2C1.sdaPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric2";
 I2C1.sdaPinConfig.hideOutputInversion  = scripting.forceWrite(false);
 I2C1.sdaPinConfig.onlyInternalResistor = scripting.forceWrite(false);
 I2C1.sdaPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
-I2C1.sclPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric3";
+I2C1.sdaPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric2";
 I2C1.sclPinConfig.hideOutputInversion  = scripting.forceWrite(false);
 I2C1.sclPinConfig.onlyInternalResistor = scripting.forceWrite(false);
 I2C1.sclPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
+I2C1.sclPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric3";
 
 PWM1.$name                      = "PWM_0";
 PWM1.timerCount                 = 8000;

@@ -38,14 +38,24 @@
 #define CONTROL_PERIOD_MS                   (5U)
 #define KEY_DEBOUNCE_MS                     (40U)
 #define KEY_LONG_PRESS_MS                   (1000U)
-#define ROUTE_TIMEOUT_MS                    (29500U)
+#define SEGMENT_TIMEOUT_MS                  (29500U)
 
-#define MOTOR_PWM_PERIOD                    (4000)
+#define MOTOR_PWM_PERIOD                    (8000)
 #define MOTOR_PWM_CRUISE                    (2300)
-#define STRAIGHT_BALANCE_DIVISOR            (3)
-#define STRAIGHT_BALANCE_MAX                (500)
-#define STRAIGHT_HEADING_KP_DIVISOR         (40)
+
+/*
+ * Straight-line wheel-distance loop. Motor A is the right wheel and Motor B
+ * is the left wheel. A positive encoder error means the right wheel has
+ * travelled farther, so apply_forward_steering() slows A and accelerates B.
+ */
+#define STRAIGHT_ENCODER_DEADBAND_COUNTS    (6)
+#define STRAIGHT_ENCODER_KP_DIVISOR         (3)
+#define STRAIGHT_ENCODER_CORRECTION_MAX     (700)
+#define STRAIGHT_HEADING_KP_DIVISOR         (40L)
 #define STRAIGHT_HEADING_CORRECTION_MAX     (600)
+#define STRAIGHT_TOTAL_CORRECTION_MAX       (1000)
+
+#define OLED_UPDATE_PERIOD_MS               (100U)
 
 /*
  * Field geometry target:
@@ -59,12 +69,19 @@
  */
 #define STRAIGHT_MIN_COUNTS_FOR_LINE        (5600U)
 #define STRAIGHT_TARGET_COUNTS              (7640U)
+#define ARC_FORCE_ENABLE_COUNTS             (8000U)
 #define ARC_TARGET_COUNTS                    (9600U)
 #define ARC_MAX_COUNTS                       (11000U)
-#define ARC_ACQUIRE_LIMIT_COUNTS             (1800U)
 #define ARC_HEADING_CHANGE_MDEG              (180000L)
-#define ARC_HEADING_KP_DIVISOR               (80)
-#define ARC_HEADING_CORRECTION_MAX           (700)
+#define ARC_LINE_LOSS_CONFIRM_TICKS          (4U)
+#define ARC_TURN_DIRECTION_MIN_MDEG          (5000L)
+#define ARC_FORCE_TURN_SLOW_ZONE_MDEG        (30000L)
+#define ARC_FORCE_TURN_FINE_ZONE_MDEG        (8000L)
+#define ARC_FORCE_TURN_TOLERANCE_MDEG        (1500L)
+#define ARC_FORCE_TURN_SETTLE_TICKS          (4U)
+#define ARC_FORCE_TURN_FAST_PWM               MOTOR_PWM_CRUISE
+#define ARC_FORCE_TURN_SLOW_PWM              (1300U)
+#define ARC_FORCE_TURN_FINE_PWM              (1100U)
 
 /*
  * Fixed C07A + S28A grayscale binding from hardware.md:
@@ -91,6 +108,16 @@
     ((CPUCLK_FREQ / 1000000U) * LINE_MUX_SETTLE_US)
 #define LINE_ERROR_MAX                      (350)
 #define LINE_PWM_CORRECTION_MAX             (4000)
+
+/* Fixed C07A OLED serial-GPIO binding from the board reference project. */
+#define DISPLAY_RST_PORT                    OLED_RST_PORT
+#define DISPLAY_RST_PIN                     OLED_RST_RST_PIN
+#define DISPLAY_DC_PORT                     OLED_DC_PORT
+#define DISPLAY_DC_PIN                      OLED_DC_DC_PIN
+#define DISPLAY_SCL_PORT                    OLED_SCL_PORT
+#define DISPLAY_SCL_PIN                     OLED_SCL_SCL_PIN
+#define DISPLAY_SDA_PORT                    OLED_SDA_PORT
+#define DISPLAY_SDA_PIN                     OLED_SDA_SDA_PIN
 
 #define MPU6050_ADDRESS                     (0x68U)
 #define MPU6050_REG_SMPLRT_DIV              (0x19U)
@@ -150,9 +177,15 @@ static int16_t gLastLineError;
 static uint8_t gEncoderAPreviousState;
 static uint8_t gEncoderBPreviousState;
 static bool gStraightHasSeenWhite;
-static bool gArcLineAcquired;
-static uint32_t gRouteStartMs;
-static int32_t gSegmentHeadingTargetMdeg;
+static bool gArcForceHeading;
+static bool gArcFallbackStraight;
+static bool gArcLineSeen;
+static uint8_t gArcLineLostTicks;
+static int8_t gArcHeadingDirection;
+static bool gArcForceTurnRight;
+static uint8_t gArcTurnSettleTicks;
+static uint32_t gSegmentStartMs;
+static int32_t gStraightStartHeadingMdeg;
 static int32_t gArcStartHeadingMdeg;
 
 static bool gImuReady;
@@ -160,6 +193,22 @@ static int32_t gGyroZBiasRaw;
 static int32_t gHeadingMdeg;
 static int32_t gHeadingRemainder;
 static uint32_t gImuLastSampleMs;
+
+static int32_t relative_heading_mdeg(void)
+{
+    switch (gDriveMode) {
+        case DRIVE_AB_STRAIGHT:
+        case DRIVE_CD_STRAIGHT:
+            return gHeadingMdeg - gStraightStartHeadingMdeg;
+
+        case DRIVE_BC_ARC:
+        case DRIVE_DA_ARC:
+            return gHeadingMdeg - gArcStartHeadingMdeg;
+
+        default:
+            return 0;
+    }
+}
 
 static int32_t clamp_i32(int32_t value, int32_t minimum, int32_t maximum)
 {
@@ -189,6 +238,160 @@ static void wait_ms(uint32_t durationMs)
     while (!elapsed_ms(startMs, durationMs)) {
         __WFI();
     }
+}
+
+static void oled_write_byte(uint8_t value, bool data)
+{
+    if (data) {
+        DL_GPIO_setPins(DISPLAY_DC_PORT, DISPLAY_DC_PIN);
+    } else {
+        DL_GPIO_clearPins(DISPLAY_DC_PORT, DISPLAY_DC_PIN);
+    }
+
+    for (uint8_t bit = 0U; bit < 8U; bit++) {
+        DL_GPIO_clearPins(DISPLAY_SCL_PORT, DISPLAY_SCL_PIN);
+        if ((value & 0x80U) != 0U) {
+            DL_GPIO_setPins(DISPLAY_SDA_PORT, DISPLAY_SDA_PIN);
+        } else {
+            DL_GPIO_clearPins(DISPLAY_SDA_PORT, DISPLAY_SDA_PIN);
+        }
+        DL_GPIO_setPins(DISPLAY_SCL_PORT, DISPLAY_SCL_PIN);
+        value <<= 1U;
+    }
+}
+
+static void oled_command(uint8_t command)
+{
+    oled_write_byte(command, false);
+}
+
+static void oled_set_position(uint8_t column, uint8_t page)
+{
+    oled_command((uint8_t) (0xB0U | (page & 0x07U)));
+    oled_command((uint8_t) (column & 0x0FU));
+    oled_command((uint8_t) (0x10U | ((column >> 4U) & 0x0FU)));
+}
+
+static void oled_clear(void)
+{
+    for (uint8_t page = 0U; page < 8U; page++) {
+        oled_set_position(0U, page);
+        for (uint8_t column = 0U; column < 128U; column++) {
+            oled_write_byte(0U, true);
+        }
+    }
+}
+
+static void oled_init(void)
+{
+    DL_GPIO_clearPins(DISPLAY_RST_PORT, DISPLAY_RST_PIN);
+    wait_ms(120U);
+    DL_GPIO_setPins(DISPLAY_RST_PORT, DISPLAY_RST_PIN);
+
+    oled_command(0xAEU);
+    oled_command(0xD5U);
+    oled_command(0x50U);
+    oled_command(0xA8U);
+    oled_command(0x3FU);
+    oled_command(0xD3U);
+    oled_command(0x00U);
+    oled_command(0x40U);
+    oled_command(0x8DU);
+    oled_command(0x14U);
+    oled_command(0x20U);
+    oled_command(0x02U);
+    oled_command(0xA1U);
+    oled_command(0xC0U);
+    oled_command(0xDAU);
+    oled_command(0x12U);
+    oled_command(0x81U);
+    oled_command(0xEFU);
+    oled_command(0xD9U);
+    oled_command(0xF1U);
+    oled_command(0xDBU);
+    oled_command(0x30U);
+    oled_command(0xA4U);
+    oled_command(0xA6U);
+    oled_command(0xAFU);
+    oled_clear();
+}
+
+static const uint8_t *oled_glyph(char character)
+{
+    static const char characters[] = " 0123456789+-.:ADEGLN";
+    static const uint8_t glyphs[][5] = {
+        {0x00U, 0x00U, 0x00U, 0x00U, 0x00U},
+        {0x3EU, 0x51U, 0x49U, 0x45U, 0x3EU},
+        {0x00U, 0x42U, 0x7FU, 0x40U, 0x00U},
+        {0x42U, 0x61U, 0x51U, 0x49U, 0x46U},
+        {0x21U, 0x41U, 0x45U, 0x4BU, 0x31U},
+        {0x18U, 0x14U, 0x12U, 0x7FU, 0x10U},
+        {0x27U, 0x45U, 0x45U, 0x45U, 0x39U},
+        {0x3CU, 0x4AU, 0x49U, 0x49U, 0x30U},
+        {0x01U, 0x71U, 0x09U, 0x05U, 0x03U},
+        {0x36U, 0x49U, 0x49U, 0x49U, 0x36U},
+        {0x06U, 0x49U, 0x49U, 0x29U, 0x1EU},
+        {0x08U, 0x08U, 0x3EU, 0x08U, 0x08U},
+        {0x08U, 0x08U, 0x08U, 0x08U, 0x08U},
+        {0x00U, 0x60U, 0x60U, 0x00U, 0x00U},
+        {0x00U, 0x36U, 0x36U, 0x00U, 0x00U},
+        {0x7EU, 0x11U, 0x11U, 0x11U, 0x7EU},
+        {0x7FU, 0x41U, 0x41U, 0x22U, 0x1CU},
+        {0x7FU, 0x49U, 0x49U, 0x49U, 0x41U},
+        {0x3EU, 0x41U, 0x49U, 0x49U, 0x7AU},
+        {0x7FU, 0x40U, 0x40U, 0x40U, 0x40U},
+        {0x7FU, 0x02U, 0x0CU, 0x10U, 0x7FU},
+    };
+
+    for (uint8_t index = 0U;
+         index < (uint8_t) (sizeof(characters) - 1U); index++) {
+        if (characters[index] == character) {
+            return glyphs[index];
+        }
+    }
+    return glyphs[0];
+}
+
+static void oled_write_text(uint8_t column, uint8_t page, const char *text)
+{
+    oled_set_position(column, page);
+    while (*text != '\0') {
+        const uint8_t *glyph = oled_glyph(*text++);
+
+        for (uint8_t glyphColumn = 0U; glyphColumn < 5U; glyphColumn++) {
+            oled_write_byte(glyph[glyphColumn], true);
+        }
+        oled_write_byte(0U, true);
+    }
+}
+
+static void oled_update_angle(void)
+{
+    static uint32_t lastUpdateMs;
+    char text[] = "ANGLE:+000.0 DEG";
+    int32_t angleMdeg = relative_heading_mdeg();
+    uint32_t angleTenths;
+
+    if (!elapsed_ms(lastUpdateMs, OLED_UPDATE_PERIOD_MS)) {
+        return;
+    }
+    lastUpdateMs = gMs;
+
+    if (angleMdeg < 0) {
+        text[6] = '-';
+        angleTenths = (uint32_t) ((-angleMdeg + 50L) / 100L);
+    } else {
+        angleTenths = (uint32_t) ((angleMdeg + 50L) / 100L);
+    }
+    if (angleTenths > 9999U) {
+        angleTenths = 9999U;
+    }
+
+    text[7] = (char) ('0' + ((angleTenths / 1000U) % 10U));
+    text[8] = (char) ('0' + ((angleTenths / 100U) % 10U));
+    text[9] = (char) ('0' + ((angleTenths / 10U) % 10U));
+    text[11] = (char) ('0' + (angleTenths % 10U));
+    oled_write_text(16U, 3U, text);
 }
 
 static void line_sensor_init(void)
@@ -466,6 +669,14 @@ static bool mpu6050_init_and_calibrate(void)
     return true;
 }
 
+static void reset_heading_reference(void)
+{
+    gHeadingMdeg = 0;
+    gHeadingRemainder = 0;
+    gImuLastSampleMs = gMs;
+    gImuDataReady = false;
+}
+
 static void imu_update_heading(void)
 {
     uint32_t nowMs = gMs;
@@ -595,33 +806,44 @@ static void stop_route(DriveMode stoppedMode)
 {
     gDriveMode = stoppedMode;
     gLastLineError = 0;
+    reset_heading_reference();
     stop_car();
 }
 
 static void begin_straight(DriveMode straightMode, bool alreadyOnWhite)
 {
     reset_segment_encoders();
-    gSegmentHeadingTargetMdeg = gHeadingMdeg;
+    /* Keep route heading continuous; only this straight's relative angle is 0. */
+    gStraightStartHeadingMdeg = gHeadingMdeg;
+    gSegmentStartMs = gMs;
     gStraightHasSeenWhite = alreadyOnWhite;
     gLastLineError = 0;
     gDriveMode = straightMode;
 }
 
-static void begin_arc(DriveMode arcMode, bool lineAlreadyAcquired)
+static void begin_arc(DriveMode arcMode)
 {
     reset_segment_encoders();
+    gSegmentStartMs = gMs;
     gArcStartHeadingMdeg = gHeadingMdeg;
-    gArcLineAcquired = lineAlreadyAcquired;
+    gArcForceHeading = false;
+    gArcFallbackStraight = false;
+    gArcLineSeen = false;
+    gArcLineLostTicks = 0U;
+    gArcHeadingDirection = -1;
+    gArcForceTurnRight = true;
+    gArcTurnSettleTicks = 0U;
     gLastLineError = 0;
     gDriveMode = arcMode;
 }
 
 static void start_route(void)
 {
-    gHeadingMdeg = 0;
-    gHeadingRemainder = 0;
-    gImuLastSampleMs = gMs;
-    gRouteStartMs = gMs;
+    if (!gImuReady) {
+        gImuReady = mpu6050_init_and_calibrate();
+    }
+
+    reset_heading_reference();
     begin_straight(DRIVE_AB_STRAIGHT, false);
 }
 
@@ -634,12 +856,12 @@ static void toggle_route(void)
     }
 }
 
-static void finish_straight(uint8_t lineMask)
+static void finish_straight(void)
 {
     if (gDriveMode == DRIVE_AB_STRAIGHT) {
-        begin_arc(DRIVE_BC_ARC, lineMask != 0U);
+        begin_arc(DRIVE_BC_ARC);
     } else {
-        begin_arc(DRIVE_DA_ARC, lineMask != 0U);
+        begin_arc(DRIVE_DA_ARC);
     }
 }
 
@@ -652,20 +874,69 @@ static void finish_arc(void)
     }
 }
 
-static bool arc_heading_reached_180(void)
+static int32_t arc_forced_turn_remaining_mdeg(void)
 {
-    int32_t headingDeltaMdeg;
+    int32_t targetHeadingMdeg =
+        gArcStartHeadingMdeg +
+        ((int32_t) gArcHeadingDirection * ARC_HEADING_CHANGE_MDEG);
+
+    return (gArcHeadingDirection > 0)
+               ? targetHeadingMdeg - gHeadingMdeg
+               : gHeadingMdeg - targetHeadingMdeg;
+}
+
+static void drive_arc_forced_turn_5ms(void)
+{
+    int32_t remainingMdeg;
+    int32_t absoluteRemainingMdeg;
+    uint16_t turnPwm;
+    bool turnRight;
 
     if (!gImuReady) {
-        return false;
+        /* A missing IMU must not turn a line-loss event into an immediate
+         * stop. Fall back to straight travel until the encoder limit. */
+        gArcForceHeading = false;
+        gArcFallbackStraight = true;
+        gLastLineError = 0;
+        set_motor_forward_pwm(MOTOR_PWM_CRUISE, MOTOR_PWM_CRUISE);
+        return;
     }
 
-    headingDeltaMdeg = gHeadingMdeg - gArcStartHeadingMdeg;
-    if (headingDeltaMdeg < 0) {
-        headingDeltaMdeg = -headingDeltaMdeg;
+    remainingMdeg = arc_forced_turn_remaining_mdeg();
+    absoluteRemainingMdeg = (remainingMdeg < 0)
+                                ? -remainingMdeg
+                                : remainingMdeg;
+
+    if (absoluteRemainingMdeg <= ARC_FORCE_TURN_TOLERANCE_MDEG) {
+        stop_car();
+        if (gArcTurnSettleTicks < ARC_FORCE_TURN_SETTLE_TICKS) {
+            gArcTurnSettleTicks++;
+        }
+        if (gArcTurnSettleTicks >= ARC_FORCE_TURN_SETTLE_TICKS) {
+            finish_arc();
+        }
+        return;
+    }
+    gArcTurnSettleTicks = 0U;
+
+    if (absoluteRemainingMdeg <= ARC_FORCE_TURN_FINE_ZONE_MDEG) {
+        turnPwm = ARC_FORCE_TURN_FINE_PWM;
+    } else if (absoluteRemainingMdeg <= ARC_FORCE_TURN_SLOW_ZONE_MDEG) {
+        turnPwm = ARC_FORCE_TURN_SLOW_PWM;
+    } else {
+        turnPwm = ARC_FORCE_TURN_FAST_PWM;
     }
 
-    return headingDeltaMdeg >= ARC_HEADING_CHANGE_MDEG;
+    /* A negative remaining angle means the target was crossed. Pivot the
+     * other way at the reduced speed instead of accepting the overshoot. */
+    turnRight = (remainingMdeg > 0) ? gArcForceTurnRight
+                                    : !gArcForceTurnRight;
+
+    if (turnRight) {
+        set_motor_forward_pwm(0U, turnPwm);
+    } else {
+        set_motor_forward_pwm(turnPwm, 0U);
+    }
 }
 
 static void drive_straight_5ms(void)
@@ -674,25 +945,35 @@ static void drive_straight_5ms(void)
     uint32_t motorACounts = abs_encoder_count(gEncoderA);
     uint32_t motorBCounts = abs_encoder_count(gEncoderB);
     uint32_t averageCounts = (motorACounts + motorBCounts) / 2U;
-    int32_t balanceCorrection =
-        ((int32_t) motorACounts - (int32_t) motorBCounts) /
-        STRAIGHT_BALANCE_DIVISOR;
+    int32_t encoderError =
+        (int32_t) motorACounts - (int32_t) motorBCounts;
+    int32_t encoderCorrection;
     int32_t headingCorrection = 0;
+    int32_t totalCorrection;
 
-    balanceCorrection = clamp_i32(balanceCorrection,
-        -STRAIGHT_BALANCE_MAX, STRAIGHT_BALANCE_MAX);
+    if ((encoderError >= -STRAIGHT_ENCODER_DEADBAND_COUNTS) &&
+        (encoderError <= STRAIGHT_ENCODER_DEADBAND_COUNTS)) {
+        encoderCorrection = 0;
+    } else {
+        encoderCorrection = encoderError / STRAIGHT_ENCODER_KP_DIVISOR;
+    }
+    encoderCorrection = clamp_i32(encoderCorrection,
+        -STRAIGHT_ENCODER_CORRECTION_MAX,
+        STRAIGHT_ENCODER_CORRECTION_MAX);
 
     if (gImuReady) {
         headingCorrection =
-            (gHeadingMdeg - gSegmentHeadingTargetMdeg) /
+            (gHeadingMdeg - gStraightStartHeadingMdeg) /
             STRAIGHT_HEADING_KP_DIVISOR;
         headingCorrection = clamp_i32(headingCorrection,
             -STRAIGHT_HEADING_CORRECTION_MAX,
             STRAIGHT_HEADING_CORRECTION_MAX);
     }
 
-    apply_forward_steering(
-        MOTOR_PWM_CRUISE, balanceCorrection + headingCorrection);
+    totalCorrection = clamp_i32(encoderCorrection + headingCorrection,
+        -STRAIGHT_TOTAL_CORRECTION_MAX,
+        STRAIGHT_TOTAL_CORRECTION_MAX);
+    apply_forward_steering(MOTOR_PWM_CRUISE, totalCorrection);
 
     if (lineMask == 0U) {
         gStraightHasSeenWhite = true;
@@ -701,7 +982,7 @@ static void drive_straight_5ms(void)
     if (((lineMask != 0U) && gStraightHasSeenWhite &&
             (averageCounts >= STRAIGHT_MIN_COUNTS_FOR_LINE)) ||
         (averageCounts >= STRAIGHT_TARGET_COUNTS)) {
-        finish_straight(lineMask);
+        finish_straight();
     }
 }
 
@@ -710,45 +991,67 @@ static void drive_arc_5ms(void)
     uint8_t lineMask = line_sensor_read_mask();
     uint32_t averageCounts = segment_average_counts();
     int32_t lineCorrection;
-    int32_t headingCorrection = 0;
+    bool lineLossConfirmed;
 
-    if (lineMask != 0U) {
-        gArcLineAcquired = true;
+    if (gArcForceHeading) {
+        drive_arc_forced_turn_5ms();
+        return;
+    }
+
+    if (gArcFallbackStraight) {
+        set_motor_forward_pwm(MOTOR_PWM_CRUISE, MOTOR_PWM_CRUISE);
+        if (averageCounts >= ARC_MAX_COUNTS) {
+            finish_arc();
+        }
+        return;
     }
 
     lineCorrection = ((int32_t) line_error_from_mask(lineMask) *
                          LINE_PWM_CORRECTION_MAX) /
         LINE_ERROR_MAX;
 
-    if (gImuReady) {
-        uint32_t limitedCounts = averageCounts;
-        int32_t expectedHeadingMdeg;
-        int32_t headingErrorMdeg;
+    apply_forward_steering(MOTOR_PWM_CRUISE, lineCorrection);
 
-        if (limitedCounts > ARC_TARGET_COUNTS) {
-            limitedCounts = ARC_TARGET_COUNTS;
+    if (lineMask != 0U) {
+        gArcLineSeen = true;
+        gArcLineLostTicks = 0U;
+    } else if (gArcLineSeen &&
+               (averageCounts > ARC_FORCE_ENABLE_COUNTS)) {
+        if (gArcLineLostTicks < ARC_LINE_LOSS_CONFIRM_TICKS) {
+            gArcLineLostTicks++;
         }
-        expectedHeadingMdeg = gArcStartHeadingMdeg -
-            (int32_t) (((int64_t) limitedCounts *
-                           ARC_HEADING_CHANGE_MDEG) /
-                ARC_TARGET_COUNTS);
-        headingErrorMdeg = gHeadingMdeg - expectedHeadingMdeg;
-        headingCorrection = headingErrorMdeg / ARC_HEADING_KP_DIVISOR;
-        headingCorrection = clamp_i32(headingCorrection,
-            -ARC_HEADING_CORRECTION_MAX,
-            ARC_HEADING_CORRECTION_MAX);
+    } else {
+        gArcLineLostTicks = 0U;
     }
 
-    apply_forward_steering(
-        MOTOR_PWM_CRUISE, lineCorrection + headingCorrection);
+    lineLossConfirmed =
+        gArcLineLostTicks >= ARC_LINE_LOSS_CONFIRM_TICKS;
 
-    if (arc_heading_reached_180()) {
-        finish_arc();
-    } else if (!gArcLineAcquired &&
-        (averageCounts >= ARC_ACQUIRE_LIMIT_COUNTS)) {
-        stop_route(DRIVE_FAULT);
-    } else if (averageCounts >= ARC_MAX_COUNTS) {
-        finish_arc();
+    if (lineLossConfirmed || (averageCounts >= ARC_MAX_COUNTS)) {
+        int32_t headingDeltaMdeg =
+            gHeadingMdeg - gArcStartHeadingMdeg;
+        uint32_t motorACounts = abs_encoder_count(gEncoderA);
+        uint32_t motorBCounts = abs_encoder_count(gEncoderB);
+
+        if (headingDeltaMdeg >= ARC_TURN_DIRECTION_MIN_MDEG) {
+            gArcHeadingDirection = 1;
+        } else if (headingDeltaMdeg <=
+                   -ARC_TURN_DIRECTION_MIN_MDEG) {
+            gArcHeadingDirection = -1;
+        }
+
+        if (motorBCounts > motorACounts) {
+            gArcForceTurnRight = true;
+        } else if (motorACounts > motorBCounts) {
+            gArcForceTurnRight = false;
+        } else if (gLastLineError != 0) {
+            gArcForceTurnRight = gLastLineError > 0;
+        }
+        gArcForceHeading = true;
+        gArcTurnSettleTicks = 0U;
+        gSegmentStartMs = gMs;
+        gLastLineError = 0;
+        drive_arc_forced_turn_5ms();
     }
 }
 
@@ -797,7 +1100,8 @@ static void key_scan_5ms(void)
 
 static void drive_tick_5ms(void)
 {
-    if (route_is_active() && elapsed_ms(gRouteStartMs, ROUTE_TIMEOUT_MS)) {
+    if (route_is_active() &&
+        elapsed_ms(gSegmentStartMs, SEGMENT_TIMEOUT_MS)) {
         stop_route(DRIVE_FAULT);
         return;
     }
@@ -859,6 +1163,7 @@ int main(void)
     DL_Timer_startCounter(PWM_0_INST);
     DL_Timer_startCounter(TIMER_0_INST);
 
+    oled_init();
     gImuReady = mpu6050_init_and_calibrate();
     __disable_irq();
     gControlTicksPending = 0U;
@@ -867,8 +1172,13 @@ int main(void)
     while (1) {
         if (take_control_tick()) {
             key_scan_5ms();
-            imu_update_heading();
+            if (route_is_active()) {
+                imu_update_heading();
+            } else {
+                reset_heading_reference();
+            }
             drive_tick_5ms();
+            oled_update_angle();
         } else {
             __WFI();
         }
