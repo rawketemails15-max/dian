@@ -362,7 +362,7 @@ static void oled_init(void)
     oled_command(0x14U);
     oled_command(0x20U);
     oled_command(0x02U);
-    oled_command(0xA1U);
+    oled_command(0xA0U);
     oled_command(0xC0U);
     oled_command(0xDAU);
     oled_command(0x12U);
