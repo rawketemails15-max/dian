@@ -32,6 +32,9 @@
 
 #include "ti_msp_dl_config.h"
 
+#include "app_config.h"
+#include "motor_control.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -42,18 +45,6 @@
 
 #define MOTOR_PWM_PERIOD                    (8000)
 #define MOTOR_PWM_CRUISE                    (2300)
-
-/*
- * Straight-line wheel-distance loop. Motor A is the right wheel and Motor B
- * is the left wheel. A positive encoder error means the right wheel has
- * travelled farther, so apply_forward_steering() slows A and accelerates B.
- */
-#define STRAIGHT_ENCODER_DEADBAND_COUNTS    (6)
-#define STRAIGHT_ENCODER_KP_DIVISOR         (3)
-#define STRAIGHT_ENCODER_CORRECTION_MAX     (700)
-#define STRAIGHT_HEADING_KP_DIVISOR         (40L)
-#define STRAIGHT_HEADING_CORRECTION_MAX     (600)
-#define STRAIGHT_TOTAL_CORRECTION_MAX       (1000)
 
 #define OLED_UPDATE_PERIOD_MS               (100U)
 
@@ -72,16 +63,16 @@
 #define ARC_FORCE_ENABLE_COUNTS             (8000U)
 #define ARC_TARGET_COUNTS                    (9600U)
 #define ARC_MAX_COUNTS                       (11000U)
-#define ARC_HEADING_CHANGE_MDEG              (180000L)
+#define ARC_HEADING_CHANGE_MDEG              (186000L)
 #define ARC_LINE_LOSS_CONFIRM_TICKS          (4U)
 #define ARC_TURN_DIRECTION_MIN_MDEG          (5000L)
 #define ARC_FORCE_TURN_SLOW_ZONE_MDEG        (30000L)
 #define ARC_FORCE_TURN_FINE_ZONE_MDEG        (8000L)
 #define ARC_FORCE_TURN_TOLERANCE_MDEG        (1500L)
-#define ARC_FORCE_TURN_SETTLE_TICKS          (4U)
+#define ARC_FORCE_TURN_SETTLE_TICKS          (20U)
 #define ARC_FORCE_TURN_FAST_PWM               MOTOR_PWM_CRUISE
-#define ARC_FORCE_TURN_SLOW_PWM              (1300U)
-#define ARC_FORCE_TURN_FINE_PWM              (1100U)
+#define ARC_FORCE_TURN_SLOW_PWM              (1800U)
+#define ARC_FORCE_TURN_FINE_PWM              (1600U)
 
 /*
  * Fixed C07A + S28A grayscale binding from hardware.md:
@@ -166,6 +157,11 @@ typedef enum {
     DRIVE_FAULT
 } DriveMode;
 
+typedef enum {
+    ROUTE_MISSION_FIRST_STAGE = 0,
+    ROUTE_MISSION_FULL
+} RouteMission;
+
 static volatile uint32_t gMs;
 static volatile int32_t gEncoderA;
 static volatile int32_t gEncoderB;
@@ -173,6 +169,7 @@ static volatile uint8_t gControlTicksPending;
 static volatile bool gImuDataReady;
 
 static DriveMode gDriveMode = DRIVE_IDLE;
+static RouteMission gRouteMission = ROUTE_MISSION_FIRST_STAGE;
 static int16_t gLastLineError;
 static uint8_t gEncoderAPreviousState;
 static uint8_t gEncoderBPreviousState;
@@ -185,8 +182,12 @@ static int8_t gArcHeadingDirection;
 static bool gArcForceTurnRight;
 static uint8_t gArcTurnSettleTicks;
 static uint32_t gSegmentStartMs;
-static int32_t gStraightStartHeadingMdeg;
+static int32_t gRouteZeroHeadingMdeg;
 static int32_t gArcStartHeadingMdeg;
+static uint16_t gStraightTargetCount;
+static uint32_t gStraightLastControlMs;
+static bool gBuzzerActive;
+static uint32_t gBuzzerStartMs;
 
 static bool gImuReady;
 static int32_t gGyroZBiasRaw;
@@ -196,18 +197,8 @@ static uint32_t gImuLastSampleMs;
 
 static int32_t relative_heading_mdeg(void)
 {
-    switch (gDriveMode) {
-        case DRIVE_AB_STRAIGHT:
-        case DRIVE_CD_STRAIGHT:
-            return gHeadingMdeg - gStraightStartHeadingMdeg;
-
-        case DRIVE_BC_ARC:
-        case DRIVE_DA_ARC:
-            return gHeadingMdeg - gArcStartHeadingMdeg;
-
-        default:
-            return 0;
-    }
+    /* Keep the two arcs cumulative: 0 -> +/-186 -> +/-372 deg. */
+    return gHeadingMdeg - gRouteZeroHeadingMdeg;
 }
 
 static int32_t clamp_i32(int32_t value, int32_t minimum, int32_t maximum)
@@ -229,6 +220,22 @@ static uint32_t abs_encoder_count(int32_t count)
 static bool elapsed_ms(uint32_t startMs, uint32_t durationMs)
 {
     return (uint32_t) (gMs - startMs) >= durationMs;
+}
+
+static void buzzer_pulse(void)
+{
+    DL_GPIO_setPins(BUZZER_PORT, BUZZER_buzzer_PIN);
+    gBuzzerStartMs = gMs;
+    gBuzzerActive = true;
+}
+
+static void buzzer_service(void)
+{
+    if (gBuzzerActive &&
+        elapsed_ms(gBuzzerStartMs, APP_BUZZER_PULSE_MS)) {
+        DL_GPIO_clearPins(BUZZER_PORT, BUZZER_buzzer_PIN);
+        gBuzzerActive = false;
+    }
 }
 
 static void wait_ms(uint32_t durationMs)
@@ -669,14 +676,6 @@ static bool mpu6050_init_and_calibrate(void)
     return true;
 }
 
-static void reset_heading_reference(void)
-{
-    gHeadingMdeg = 0;
-    gHeadingRemainder = 0;
-    gImuLastSampleMs = gMs;
-    gImuDataReady = false;
-}
-
 static void imu_update_heading(void)
 {
     uint32_t nowMs = gMs;
@@ -709,6 +708,30 @@ static void imu_update_heading(void)
     gHeadingMdeg += numerator / MPU6050_GYRO_SCALE_DENOMINATOR;
     gHeadingRemainder = numerator % MPU6050_GYRO_SCALE_DENOMINATOR;
     gImuLastSampleMs = nowMs;
+}
+
+static void imu_reset_route_angle(void)
+{
+    /*
+     * Gyro bias is calibrated at power-up, but angle integration belongs to
+     * the route.  Start a fresh route angle without recalibrating the sensor.
+     */
+    gHeadingMdeg = 0;
+    gHeadingRemainder = 0;
+    gRouteZeroHeadingMdeg = 0;
+    gImuLastSampleMs = gMs;
+    gImuDataReady = false;
+}
+
+static void imu_begin_arc_sampling(bool resetRouteAngle)
+{
+    if (resetRouteAngle) {
+        imu_reset_route_angle();
+    } else {
+        /* Exclude the preceding straight section from the next integration. */
+        gImuLastSampleMs = gMs;
+        gImuDataReady = false;
+    }
 }
 
 static uint16_t clamp_forward_pwm(int32_t pwm)
@@ -786,12 +809,41 @@ static void reset_segment_encoders(void)
     __enable_irq();
 }
 
+static void read_segment_encoder_counts(
+    uint32_t *motorACounts, uint32_t *motorBCounts)
+{
+    int32_t encoderA;
+    int32_t encoderB;
+
+    /* Snapshot both wheels at the same instant for speed comparison. */
+    __disable_irq();
+    encoderA = gEncoderA;
+    encoderB = gEncoderB;
+    __enable_irq();
+
+    *motorACounts = abs_encoder_count(encoderA);
+    *motorBCounts = abs_encoder_count(encoderB);
+}
+
 static uint32_t segment_average_counts(void)
 {
-    uint32_t motorACounts = abs_encoder_count(gEncoderA);
-    uint32_t motorBCounts = abs_encoder_count(gEncoderB);
+    uint32_t motorACounts;
+    uint32_t motorBCounts;
+
+    read_segment_encoder_counts(&motorACounts, &motorBCounts);
 
     return (motorACounts + motorBCounts) / 2U;
+}
+
+static void update_straight_target(void)
+{
+    uint16_t nextTarget = (uint16_t) (gStraightTargetCount +
+        APP_TRACK_BASE_RAMP_COUNTS);
+
+    if (nextTarget > APP_TRACK_BASE_TARGET_COUNTS) {
+        nextTarget = APP_TRACK_BASE_TARGET_COUNTS;
+    }
+    gStraightTargetCount = nextTarget;
 }
 
 static bool route_is_active(void)
@@ -806,15 +858,16 @@ static void stop_route(DriveMode stoppedMode)
 {
     gDriveMode = stoppedMode;
     gLastLineError = 0;
-    reset_heading_reference();
+    motor_control_brake();
     stop_car();
 }
 
 static void begin_straight(DriveMode straightMode, bool alreadyOnWhite)
 {
     reset_segment_encoders();
-    /* Keep route heading continuous; only this straight's relative angle is 0. */
-    gStraightStartHeadingMdeg = gHeadingMdeg;
+    gStraightTargetCount = 0U;
+    gStraightLastControlMs = gMs;
+    motor_control_start(gMs);
     gSegmentStartMs = gMs;
     gStraightHasSeenWhite = alreadyOnWhite;
     gLastLineError = 0;
@@ -825,6 +878,8 @@ static void begin_arc(DriveMode arcMode)
 {
     reset_segment_encoders();
     gSegmentStartMs = gMs;
+    /* BC is the angular origin; DA continues from BC's accumulated angle. */
+    imu_begin_arc_sampling(arcMode == DRIVE_BC_ARC);
     gArcStartHeadingMdeg = gHeadingMdeg;
     gArcForceHeading = false;
     gArcFallbackStraight = false;
@@ -837,29 +892,41 @@ static void begin_arc(DriveMode arcMode)
     gDriveMode = arcMode;
 }
 
-static void start_route(void)
+static void start_route(RouteMission mission)
 {
+    /*
+     * Gyro bias is calibrated once at power-up.  Angle integration does not
+     * begin here: AB must display 0 deg, and BC will establish route 0 deg.
+     */
+    stop_car();
+    gRouteMission = mission;
     if (!gImuReady) {
         gImuReady = mpu6050_init_and_calibrate();
     }
-
-    reset_heading_reference();
+    imu_reset_route_angle();
+    __disable_irq();
+    gControlTicksPending = 0U;
+    __enable_irq();
     begin_straight(DRIVE_AB_STRAIGHT, false);
 }
 
-static void toggle_route(void)
+static void toggle_first_stage_route(void)
 {
     if (route_is_active()) {
         stop_route(DRIVE_IDLE);
     } else {
-        start_route();
+        start_route(ROUTE_MISSION_FIRST_STAGE);
     }
 }
 
 static void finish_straight(void)
 {
     if (gDriveMode == DRIVE_AB_STRAIGHT) {
-        begin_arc(DRIVE_BC_ARC);
+        if (gRouteMission == ROUTE_MISSION_FIRST_STAGE) {
+            stop_route(DRIVE_COMPLETE);
+        } else {
+            begin_arc(DRIVE_BC_ARC);
+        }
     } else {
         begin_arc(DRIVE_DA_ARC);
     }
@@ -876,9 +943,11 @@ static void finish_arc(void)
 
 static int32_t arc_forced_turn_remaining_mdeg(void)
 {
-    int32_t targetHeadingMdeg =
-        gArcStartHeadingMdeg +
-        ((int32_t) gArcHeadingDirection * ARC_HEADING_CHANGE_MDEG);
+    int32_t halfTurnCount =
+        (gDriveMode == DRIVE_DA_ARC) ? 2L : 1L;
+    int32_t targetHeadingMdeg = gRouteZeroHeadingMdeg +
+        ((int32_t) gArcHeadingDirection * halfTurnCount *
+            ARC_HEADING_CHANGE_MDEG);
 
     return (gArcHeadingDirection > 0)
                ? targetHeadingMdeg - gHeadingMdeg
@@ -942,47 +1011,39 @@ static void drive_arc_forced_turn_5ms(void)
 static void drive_straight_5ms(void)
 {
     uint8_t lineMask = line_sensor_read_mask();
-    uint32_t motorACounts = abs_encoder_count(gEncoderA);
-    uint32_t motorBCounts = abs_encoder_count(gEncoderB);
-    uint32_t averageCounts = (motorACounts + motorBCounts) / 2U;
-    int32_t encoderError =
-        (int32_t) motorACounts - (int32_t) motorBCounts;
-    int32_t encoderCorrection;
-    int32_t headingCorrection = 0;
-    int32_t totalCorrection;
+    uint32_t motorACounts;
+    uint32_t motorBCounts;
+    uint32_t averageCounts;
+    bool blackLineDetected;
 
-    if ((encoderError >= -STRAIGHT_ENCODER_DEADBAND_COUNTS) &&
-        (encoderError <= STRAIGHT_ENCODER_DEADBAND_COUNTS)) {
-        encoderCorrection = 0;
-    } else {
-        encoderCorrection = encoderError / STRAIGHT_ENCODER_KP_DIVISOR;
-    }
-    encoderCorrection = clamp_i32(encoderCorrection,
-        -STRAIGHT_ENCODER_CORRECTION_MAX,
-        STRAIGHT_ENCODER_CORRECTION_MAX);
-
-    if (gImuReady) {
-        headingCorrection =
-            (gHeadingMdeg - gStraightStartHeadingMdeg) /
-            STRAIGHT_HEADING_KP_DIVISOR;
-        headingCorrection = clamp_i32(headingCorrection,
-            -STRAIGHT_HEADING_CORRECTION_MAX,
-            STRAIGHT_HEADING_CORRECTION_MAX);
-    }
-
-    totalCorrection = clamp_i32(encoderCorrection + headingCorrection,
-        -STRAIGHT_TOTAL_CORRECTION_MAX,
-        STRAIGHT_TOTAL_CORRECTION_MAX);
-    apply_forward_steering(MOTOR_PWM_CRUISE, totalCorrection);
+    read_segment_encoder_counts(&motorACounts, &motorBCounts);
+    averageCounts = (motorACounts + motorBCounts) / 2U;
 
     if (lineMask == 0U) {
         gStraightHasSeenWhite = true;
     }
 
-    if (((lineMask != 0U) && gStraightHasSeenWhite &&
-            (averageCounts >= STRAIGHT_MIN_COUNTS_FOR_LINE)) ||
+    blackLineDetected = (lineMask != 0U) && gStraightHasSeenWhite &&
+        (averageCounts >= STRAIGHT_MIN_COUNTS_FOR_LINE);
+
+    if (blackLineDetected ||
         (averageCounts >= STRAIGHT_TARGET_COUNTS)) {
+        if (blackLineDetected) {
+            buzzer_pulse();
+        }
         finish_straight();
+        return;
+    }
+
+    if ((uint32_t) (gMs - gStraightLastControlMs) >=
+        APP_CONTROL_PERIOD_MS) {
+        gStraightLastControlMs += APP_CONTROL_PERIOD_MS;
+        update_straight_target();
+        motor_control_update_20ms(gMs, gStraightTargetCount,
+            gStraightTargetCount);
+        if (motor_control_stalled()) {
+            stop_route(DRIVE_FAULT);
+        }
     }
 }
 
@@ -1030,8 +1091,14 @@ static void drive_arc_5ms(void)
     if (lineLossConfirmed || (averageCounts >= ARC_MAX_COUNTS)) {
         int32_t headingDeltaMdeg =
             gHeadingMdeg - gArcStartHeadingMdeg;
-        uint32_t motorACounts = abs_encoder_count(gEncoderA);
-        uint32_t motorBCounts = abs_encoder_count(gEncoderB);
+        uint32_t motorACounts;
+        uint32_t motorBCounts;
+
+        if (lineLossConfirmed) {
+            buzzer_pulse();
+        }
+
+        read_segment_encoder_counts(&motorACounts, &motorBCounts);
 
         if (headingDeltaMdeg >= ARC_TURN_DIRECTION_MIN_MDEG) {
             gArcHeadingDirection = 1;
@@ -1086,7 +1153,7 @@ static void key_scan_5ms(void)
             longPressHandled = false;
         } else {
             if (!longPressHandled) {
-                toggle_route();
+                toggle_first_stage_route();
             }
         }
     }
@@ -1094,7 +1161,7 @@ static void key_scan_5ms(void)
     if (debouncedPressed && !longPressHandled &&
         ((gMs - pressStartMs) >= KEY_LONG_PRESS_MS)) {
         longPressHandled = true;
-        stop_route(DRIVE_IDLE);
+        start_route(ROUTE_MISSION_FULL);
     }
 }
 
@@ -1144,8 +1211,10 @@ int main(void)
 {
     SYSCFG_DL_init();
     line_sensor_init();
+    motor_control_init();
 
     DL_GPIO_setPins(LED_PORT, LED_led_PIN);
+    DL_GPIO_clearPins(BUZZER_PORT, BUZZER_buzzer_PIN);
     stop_car();
 
     gEncoderAPreviousState =
@@ -1165,6 +1234,7 @@ int main(void)
 
     oled_init();
     gImuReady = mpu6050_init_and_calibrate();
+    imu_reset_route_angle();
     __disable_irq();
     gControlTicksPending = 0U;
     __enable_irq();
@@ -1172,12 +1242,12 @@ int main(void)
     while (1) {
         if (take_control_tick()) {
             key_scan_5ms();
-            if (route_is_active()) {
+            if ((gDriveMode == DRIVE_BC_ARC) ||
+                (gDriveMode == DRIVE_DA_ARC)) {
                 imu_update_heading();
-            } else {
-                reset_heading_reference();
             }
             drive_tick_5ms();
+            buzzer_service();
             oled_update_angle();
         } else {
             __WFI();
@@ -1203,6 +1273,7 @@ void GROUP1_IRQHandler(void)
         ENCODER_B_PORT, ENCODER_B1_PIN | ENCODER_B2_PIN);
 
     if ((gpioAStatus & (ENCODER_A1_PIN | ENCODER_A2_PIN)) != 0U) {
+        motor_control_handle_encoder_a_irq();
         uint8_t currentState =
             encoder_state(ENCODER_A_PORT, ENCODER_A1_PIN, ENCODER_A2_PIN);
         gEncoderA += quadrature_delta(gEncoderAPreviousState, currentState);
@@ -1210,6 +1281,7 @@ void GROUP1_IRQHandler(void)
     }
 
     if ((encoderBStatus & (ENCODER_B1_PIN | ENCODER_B2_PIN)) != 0U) {
+        motor_control_handle_encoder_b_irq();
         uint8_t currentState =
             encoder_state(ENCODER_B_PORT, ENCODER_B1_PIN, ENCODER_B2_PIN);
         gEncoderB += quadrature_delta(gEncoderBPreviousState, currentState);

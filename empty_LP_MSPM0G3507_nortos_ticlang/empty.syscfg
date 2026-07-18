@@ -26,6 +26,7 @@ const GPIO9  = GPIO.addInstance();
 const GPIO10 = GPIO.addInstance();
 const GPIO11 = GPIO.addInstance();
 const GPIO12 = GPIO.addInstance();
+const GPIO13 = GPIO.addInstance();
 const I2C    = scripting.addModule("/ti/driverlib/I2C", {}, false);
 const I2C1   = I2C.addInstance();
 const PWM    = scripting.addModule("/ti/driverlib/PWM", {}, false);
@@ -127,6 +128,10 @@ GPIO12.$name                          = "OLED_SDA";
 GPIO12.associatedPins[0].$name        = "SDA";
 GPIO12.associatedPins[0].initialValue = "SET";
 GPIO12.associatedPins[0].pin.$assign  = "PA31";
+
+GPIO13.$name                         = "BUZZER";
+GPIO13.associatedPins[0].$name       = "buzzer";
+GPIO13.associatedPins[0].pin.$assign = "PA9";
 
 I2C1.$name                             = "I2C_IMU";
 I2C1.basicEnableController             = true;
