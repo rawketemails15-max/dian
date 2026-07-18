@@ -1,0 +1,4 @@
+interface:
+  display_name: "C07A + S28A 电赛小车"
+  short_description: "C07A/S28A 小车的 MSPM0 与 K230 硬件事实及防幻觉工作流"
+  default_prompt: "使用 $c07a-s28a-car 检查并安全修改当前 C07A + S28A 小车的 MSPM0 SysConfig 或 K230 CanMV 工程。"
