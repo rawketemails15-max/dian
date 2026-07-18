@@ -41,7 +41,17 @@
 #define CONTROL_PERIOD_MS                   (5U)
 #define KEY_DEBOUNCE_MS                     (40U)
 #define KEY_LONG_PRESS_MS                   (1000U)
+#define KEY_DOUBLE_PRESS_MS                 (1000U)
 #define SEGMENT_TIMEOUT_MS                  (29500U)
+#define TASK3_HALF_ARC_COUNT                (8U)
+#define TASK3_HEADING_OFFSET_MDEG           (40000L)
+#define TASK3_HALF_TURN_MDEG                (180000L)
+#define TASK3_FULL_TURN_MDEG                (360000L)
+#define TASK3_HEADING_TOLERANCE_MDEG        (1500L)
+#define TASK3_TURN_SETTLE_TICKS             (20U)
+#define TASK3_TURN_FAST_PWM                 MOTOR_PWM_CRUISE
+#define TASK3_TURN_SLOW_PWM                 (1800U)
+#define TASK3_TURN_FINE_PWM                 (1600U)
 
 #define MOTOR_PWM_PERIOD                    (8000)
 #define MOTOR_PWM_CRUISE                    (2300)
@@ -153,13 +163,18 @@ typedef enum {
     DRIVE_BC_ARC,
     DRIVE_CD_STRAIGHT,
     DRIVE_DA_ARC,
+    DRIVE_TASK3_ALIGN_AXIS,
+    DRIVE_TASK3_ALIGN_OFFSET,
+    DRIVE_TASK3_STRAIGHT,
+    DRIVE_TASK3_ARC,
     DRIVE_COMPLETE,
     DRIVE_FAULT
 } DriveMode;
 
 typedef enum {
     ROUTE_MISSION_FIRST_STAGE = 0,
-    ROUTE_MISSION_FULL
+    ROUTE_MISSION_FULL,
+    ROUTE_MISSION_TASK3
 } RouteMission;
 
 static volatile uint32_t gMs;
@@ -188,6 +203,11 @@ static uint16_t gStraightTargetCount;
 static uint32_t gStraightLastControlMs;
 static bool gBuzzerActive;
 static uint32_t gBuzzerStartMs;
+static bool gPointLightActive;
+static uint32_t gPointLightStartMs;
+static uint8_t gTask3HalfArcCount;
+static uint8_t gTask3TurnSettleTicks;
+static int32_t gTask3AxisTargetMdeg;
 
 static bool gImuReady;
 static int32_t gGyroZBiasRaw;
@@ -197,8 +217,24 @@ static uint32_t gImuLastSampleMs;
 
 static int32_t relative_heading_mdeg(void)
 {
-    /* Keep the two arcs cumulative: 0 -> +/-186 -> +/-372 deg. */
+    /* Positive heading is a left turn; right turns reduce the angle. */
     return gHeadingMdeg - gRouteZeroHeadingMdeg;
+}
+
+static int32_t task3_heading_error_mdeg(
+    int32_t targetHeadingMdeg, int32_t currentHeadingMdeg)
+{
+    int32_t errorMdeg = targetHeadingMdeg - currentHeadingMdeg;
+
+    /* 0 and 360 deg are the same chassis direction. Keep +180 deg so the
+     * first C-to-B half-circle makeup uses the required left turn. */
+    while (errorMdeg > TASK3_HALF_TURN_MDEG) {
+        errorMdeg -= TASK3_FULL_TURN_MDEG;
+    }
+    while (errorMdeg < -TASK3_HALF_TURN_MDEG) {
+        errorMdeg += TASK3_FULL_TURN_MDEG;
+    }
+    return errorMdeg;
 }
 
 static int32_t clamp_i32(int32_t value, int32_t minimum, int32_t maximum)
@@ -235,6 +271,25 @@ static void buzzer_service(void)
         elapsed_ms(gBuzzerStartMs, APP_BUZZER_PULSE_MS)) {
         DL_GPIO_clearPins(BUZZER_PORT, BUZZER_buzzer_PIN);
         gBuzzerActive = false;
+    }
+}
+
+static void signal_route_point(void)
+{
+    buzzer_pulse();
+    if (gRouteMission == ROUTE_MISSION_TASK3) {
+        DL_GPIO_setPins(LED_PORT, LED_led_PIN);
+        gPointLightActive = true;
+        gPointLightStartMs = gMs;
+    }
+}
+
+static void point_light_service(void)
+{
+    if (gPointLightActive &&
+        elapsed_ms(gPointLightStartMs, APP_BUZZER_PULSE_MS)) {
+        DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
+        gPointLightActive = false;
     }
 }
 
@@ -851,7 +906,11 @@ static bool route_is_active(void)
     return (gDriveMode == DRIVE_AB_STRAIGHT) ||
         (gDriveMode == DRIVE_BC_ARC) ||
         (gDriveMode == DRIVE_CD_STRAIGHT) ||
-        (gDriveMode == DRIVE_DA_ARC);
+        (gDriveMode == DRIVE_DA_ARC) ||
+        (gDriveMode == DRIVE_TASK3_ALIGN_AXIS) ||
+        (gDriveMode == DRIVE_TASK3_ALIGN_OFFSET) ||
+        (gDriveMode == DRIVE_TASK3_STRAIGHT) ||
+        (gDriveMode == DRIVE_TASK3_ARC);
 }
 
 static void stop_route(DriveMode stoppedMode)
@@ -892,6 +951,24 @@ static void begin_arc(DriveMode arcMode)
     gDriveMode = arcMode;
 }
 
+static void begin_task3_heading(DriveMode headingMode)
+{
+    stop_car();
+    gTask3TurnSettleTicks = 0U;
+    gSegmentStartMs = gMs;
+    gDriveMode = headingMode;
+}
+
+static void begin_task3_straight(void)
+{
+    begin_straight(DRIVE_TASK3_STRAIGHT, false);
+}
+
+static void begin_task3_arc(void)
+{
+    begin_arc(DRIVE_TASK3_ARC);
+}
+
 static void start_route(RouteMission mission)
 {
     /*
@@ -904,10 +981,26 @@ static void start_route(RouteMission mission)
         gImuReady = mpu6050_init_and_calibrate();
     }
     imu_reset_route_angle();
+    gPointLightActive = false;
+    if (mission == ROUTE_MISSION_TASK3) {
+        /* Task 3 owns PB9 as the point indicator; old missions stay unchanged. */
+        DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
+        gTask3HalfArcCount = 0U;
+        gTask3AxisTargetMdeg = 0;
+        motor_control_start(gMs);
+    } else {
+        DL_GPIO_setPins(LED_PORT, LED_led_PIN);
+    }
     __disable_irq();
     gControlTicksPending = 0U;
     __enable_irq();
-    begin_straight(DRIVE_AB_STRAIGHT, false);
+    if ((mission == ROUTE_MISSION_TASK3) && !gImuReady) {
+        stop_route(DRIVE_FAULT);
+    } else if (mission == ROUTE_MISSION_TASK3) {
+        begin_task3_heading(DRIVE_TASK3_ALIGN_AXIS);
+    } else {
+        begin_straight(DRIVE_AB_STRAIGHT, false);
+    }
 }
 
 static void toggle_first_stage_route(void)
@@ -921,7 +1014,9 @@ static void toggle_first_stage_route(void)
 
 static void finish_straight(void)
 {
-    if (gDriveMode == DRIVE_AB_STRAIGHT) {
+    if (gDriveMode == DRIVE_TASK3_STRAIGHT) {
+        begin_task3_arc();
+    } else if (gDriveMode == DRIVE_AB_STRAIGHT) {
         if (gRouteMission == ROUTE_MISSION_FIRST_STAGE) {
             stop_route(DRIVE_COMPLETE);
         } else {
@@ -952,6 +1047,62 @@ static int32_t arc_forced_turn_remaining_mdeg(void)
     return (gArcHeadingDirection > 0)
                ? targetHeadingMdeg - gHeadingMdeg
                : gHeadingMdeg - targetHeadingMdeg;
+}
+
+static void drive_task3_heading_5ms(void)
+{
+    int32_t targetHeadingMdeg = gTask3AxisTargetMdeg;
+    int32_t errorMdeg;
+    int32_t absoluteErrorMdeg;
+    uint16_t turnPwm;
+
+    if (gDriveMode == DRIVE_TASK3_ALIGN_OFFSET) {
+        if (gTask3HalfArcCount == 0U) {
+            /* A-to-C initial diagonal: 0 -> -40 deg is a right turn. */
+            targetHeadingMdeg -= TASK3_HEADING_OFFSET_MDEG;
+        } else if ((gTask3HalfArcCount & 0x01U) != 0U) {
+            /* After C-to-B: 180 -> 220 deg is a left turn. */
+            targetHeadingMdeg += TASK3_HEADING_OFFSET_MDEG;
+        } else {
+            /* After D-to-A: 360 -> 320 deg is a right turn. */
+            targetHeadingMdeg -= TASK3_HEADING_OFFSET_MDEG;
+        }
+    }
+
+    errorMdeg = task3_heading_error_mdeg(
+        targetHeadingMdeg, relative_heading_mdeg());
+    absoluteErrorMdeg = (errorMdeg < 0) ? -errorMdeg : errorMdeg;
+
+    if (absoluteErrorMdeg <= TASK3_HEADING_TOLERANCE_MDEG) {
+        stop_car();
+        if (gTask3TurnSettleTicks < TASK3_TURN_SETTLE_TICKS) {
+            gTask3TurnSettleTicks++;
+        }
+        if (gTask3TurnSettleTicks >= TASK3_TURN_SETTLE_TICKS) {
+            if (gDriveMode == DRIVE_TASK3_ALIGN_AXIS) {
+                begin_task3_heading(DRIVE_TASK3_ALIGN_OFFSET);
+            } else {
+                begin_task3_straight();
+            }
+        }
+        return;
+    }
+    gTask3TurnSettleTicks = 0U;
+
+    if (absoluteErrorMdeg <= ARC_FORCE_TURN_FINE_ZONE_MDEG) {
+        turnPwm = TASK3_TURN_FINE_PWM;
+    } else if (absoluteErrorMdeg <= ARC_FORCE_TURN_SLOW_ZONE_MDEG) {
+        turnPwm = TASK3_TURN_SLOW_PWM;
+    } else {
+        turnPwm = TASK3_TURN_FAST_PWM;
+    }
+
+    /* Positive heading error commands a left pivot; negative commands right. */
+    if (errorMdeg > 0) {
+        set_motor_forward_pwm(turnPwm, 0U);
+    } else {
+        set_motor_forward_pwm(0U, turnPwm);
+    }
 }
 
 static void drive_arc_forced_turn_5ms(void)
@@ -1027,9 +1178,10 @@ static void drive_straight_5ms(void)
         (averageCounts >= STRAIGHT_MIN_COUNTS_FOR_LINE);
 
     if (blackLineDetected ||
-        (averageCounts >= STRAIGHT_TARGET_COUNTS)) {
+        ((gRouteMission != ROUTE_MISSION_TASK3) &&
+            (averageCounts >= STRAIGHT_TARGET_COUNTS))) {
         if (blackLineDetected) {
-            buzzer_pulse();
+            signal_route_point();
         }
         finish_straight();
         return;
@@ -1095,7 +1247,30 @@ static void drive_arc_5ms(void)
         uint32_t motorBCounts;
 
         if (lineLossConfirmed) {
-            buzzer_pulse();
+            signal_route_point();
+        }
+
+        if (gDriveMode == DRIVE_TASK3_ARC) {
+            if (!lineLossConfirmed) {
+                stop_route(DRIVE_FAULT);
+                return;
+            }
+            if (gTask3HalfArcCount < TASK3_HALF_ARC_COUNT) {
+                gTask3HalfArcCount++;
+            }
+            if (gTask3HalfArcCount >= TASK3_HALF_ARC_COUNT) {
+                stop_route(DRIVE_COMPLETE);
+            } else if (!gImuReady) {
+                stop_route(DRIVE_FAULT);
+            } else {
+                /* Accumulate the makeup axis: 180, 360, 540... degrees.
+                 * Odd arcs then add 40 deg left; even arcs subtract 40 deg
+                 * right. Wrapped heading error makes 360 deg equal 0 deg. */
+                gTask3AxisTargetMdeg =
+                    (int32_t) gTask3HalfArcCount * TASK3_HALF_TURN_MDEG;
+                begin_task3_heading(DRIVE_TASK3_ALIGN_AXIS);
+            }
+            return;
         }
 
         read_segment_encoder_counts(&motorACounts, &motorBCounts);
@@ -1134,6 +1309,9 @@ static void key_scan_5ms(void)
     static uint8_t stableTicks;
     static uint32_t pressStartMs;
     static bool longPressHandled;
+    static bool firstShortPending;
+    static uint32_t firstShortReleaseMs;
+    static bool secondShortCandidate;
     bool rawPressed = key_pressed_raw();
 
     if (rawPressed == rawPrev) {
@@ -1143,6 +1321,16 @@ static void key_scan_5ms(void)
     } else {
         rawPrev = rawPressed;
         stableTicks = 0;
+        if (rawPressed && firstShortPending) {
+            if ((uint32_t) (gMs - firstShortReleaseMs) <=
+                KEY_DOUBLE_PRESS_MS) {
+                secondShortCandidate = true;
+            } else {
+                firstShortPending = false;
+                secondShortCandidate = false;
+                toggle_first_stage_route();
+            }
+        }
     }
 
     if ((stableTicks == (KEY_DEBOUNCE_MS / CONTROL_PERIOD_MS)) &&
@@ -1151,9 +1339,18 @@ static void key_scan_5ms(void)
         if (debouncedPressed) {
             pressStartMs = gMs;
             longPressHandled = false;
+            if (secondShortCandidate) {
+                firstShortPending = false;
+            }
         } else {
             if (!longPressHandled) {
-                toggle_first_stage_route();
+                if (secondShortCandidate) {
+                    secondShortCandidate = false;
+                    start_route(ROUTE_MISSION_TASK3);
+                } else {
+                    firstShortPending = true;
+                    firstShortReleaseMs = gMs;
+                }
             }
         }
     }
@@ -1161,7 +1358,17 @@ static void key_scan_5ms(void)
     if (debouncedPressed && !longPressHandled &&
         ((gMs - pressStartMs) >= KEY_LONG_PRESS_MS)) {
         longPressHandled = true;
+        firstShortPending = false;
+        secondShortCandidate = false;
         start_route(ROUTE_MISSION_FULL);
+    }
+
+    if (firstShortPending && !rawPressed && !debouncedPressed &&
+        ((uint32_t) (gMs - firstShortReleaseMs) >=
+            KEY_DOUBLE_PRESS_MS)) {
+        firstShortPending = false;
+        secondShortCandidate = false;
+        toggle_first_stage_route();
     }
 }
 
@@ -1176,12 +1383,19 @@ static void drive_tick_5ms(void)
     switch (gDriveMode) {
     case DRIVE_AB_STRAIGHT:
     case DRIVE_CD_STRAIGHT:
+    case DRIVE_TASK3_STRAIGHT:
         drive_straight_5ms();
         break;
 
     case DRIVE_BC_ARC:
     case DRIVE_DA_ARC:
+    case DRIVE_TASK3_ARC:
         drive_arc_5ms();
+        break;
+
+    case DRIVE_TASK3_ALIGN_AXIS:
+    case DRIVE_TASK3_ALIGN_OFFSET:
+        drive_task3_heading_5ms();
         break;
 
     case DRIVE_IDLE:
@@ -1243,11 +1457,14 @@ int main(void)
         if (take_control_tick()) {
             key_scan_5ms();
             if ((gDriveMode == DRIVE_BC_ARC) ||
-                (gDriveMode == DRIVE_DA_ARC)) {
+                (gDriveMode == DRIVE_DA_ARC) ||
+                ((gRouteMission == ROUTE_MISSION_TASK3) &&
+                    route_is_active())) {
                 imu_update_heading();
             }
             drive_tick_5ms();
             buzzer_service();
+            point_light_service();
             oled_update_angle();
         } else {
             __WFI();
