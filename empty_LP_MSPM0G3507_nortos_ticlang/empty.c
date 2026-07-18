@@ -44,7 +44,8 @@
 #define KEY_DOUBLE_PRESS_MS                 (1000U)
 #define SEGMENT_TIMEOUT_MS                  (29500U)
 #define TASK3_HALF_ARC_COUNT                (8U)
-#define TASK3_HEADING_OFFSET_MDEG           (40000L)
+#define TASK3_INITIAL_OFFSET_MDEG           (40000L)
+#define TASK3_POST_ARC_OFFSET_MDEG          (20000L)
 #define TASK3_HALF_TURN_MDEG                (180000L)
 #define TASK3_FULL_TURN_MDEG                (360000L)
 #define TASK3_HEADING_TOLERANCE_MDEG        (1500L)
@@ -52,6 +53,11 @@
 #define TASK3_TURN_FAST_PWM                 MOTOR_PWM_CRUISE
 #define TASK3_TURN_SLOW_PWM                 (1800U)
 #define TASK3_TURN_FINE_PWM                 (1600U)
+#define TASK3_STRAIGHT_HEADING_DEADBAND_MDEG (2500L)
+#define TASK3_STRAIGHT_MDEG_PER_COUNT       (5000L)
+#define TASK3_STRAIGHT_MAX_CORRECTION_COUNTS (2U)
+#define TASK3_STRAIGHT_MIN_TARGET_COUNTS    (10U)
+#define TASK3_STRAIGHT_ERROR_FILTER_DIVISOR (4L)
 
 #define MOTOR_PWM_PERIOD                    (8000)
 #define MOTOR_PWM_CRUISE                    (2300)
@@ -208,6 +214,7 @@ static uint32_t gPointLightStartMs;
 static uint8_t gTask3HalfArcCount;
 static uint8_t gTask3TurnSettleTicks;
 static int32_t gTask3AxisTargetMdeg;
+static int32_t gTask3StraightFilteredErrorMdeg;
 
 static bool gImuReady;
 static int32_t gGyroZBiasRaw;
@@ -235,6 +242,23 @@ static int32_t task3_heading_error_mdeg(
         errorMdeg += TASK3_FULL_TURN_MDEG;
     }
     return errorMdeg;
+}
+
+static int32_t task3_departure_heading_mdeg(void)
+{
+    int32_t targetHeadingMdeg = gTask3AxisTargetMdeg;
+
+    if (gTask3HalfArcCount == 0U) {
+        /* A-to-C initial diagonal: 0 -> -40 deg is a right turn. */
+        targetHeadingMdeg -= TASK3_INITIAL_OFFSET_MDEG;
+    } else if ((gTask3HalfArcCount & 0x01U) != 0U) {
+        /* After C-to-B: 180 -> 200 deg is a left turn. */
+        targetHeadingMdeg += TASK3_POST_ARC_OFFSET_MDEG;
+    } else {
+        /* After D-to-A: 360 -> 340 deg is a right turn. */
+        targetHeadingMdeg -= TASK3_POST_ARC_OFFSET_MDEG;
+    }
+    return targetHeadingMdeg;
 }
 
 static int32_t clamp_i32(int32_t value, int32_t minimum, int32_t maximum)
@@ -961,6 +985,7 @@ static void begin_task3_heading(DriveMode headingMode)
 
 static void begin_task3_straight(void)
 {
+    gTask3StraightFilteredErrorMdeg = 0;
     begin_straight(DRIVE_TASK3_STRAIGHT, false);
 }
 
@@ -1057,16 +1082,7 @@ static void drive_task3_heading_5ms(void)
     uint16_t turnPwm;
 
     if (gDriveMode == DRIVE_TASK3_ALIGN_OFFSET) {
-        if (gTask3HalfArcCount == 0U) {
-            /* A-to-C initial diagonal: 0 -> -40 deg is a right turn. */
-            targetHeadingMdeg -= TASK3_HEADING_OFFSET_MDEG;
-        } else if ((gTask3HalfArcCount & 0x01U) != 0U) {
-            /* After C-to-B: 180 -> 220 deg is a left turn. */
-            targetHeadingMdeg += TASK3_HEADING_OFFSET_MDEG;
-        } else {
-            /* After D-to-A: 360 -> 320 deg is a right turn. */
-            targetHeadingMdeg -= TASK3_HEADING_OFFSET_MDEG;
-        }
+        targetHeadingMdeg = task3_departure_heading_mdeg();
     }
 
     errorMdeg = task3_heading_error_mdeg(
@@ -1165,6 +1181,8 @@ static void drive_straight_5ms(void)
     uint32_t motorACounts;
     uint32_t motorBCounts;
     uint32_t averageCounts;
+    uint16_t targetCountA;
+    uint16_t targetCountB;
     bool blackLineDetected;
 
     read_segment_encoder_counts(&motorACounts, &motorBCounts);
@@ -1191,8 +1209,60 @@ static void drive_straight_5ms(void)
         APP_CONTROL_PERIOD_MS) {
         gStraightLastControlMs += APP_CONTROL_PERIOD_MS;
         update_straight_target();
-        motor_control_update_20ms(gMs, gStraightTargetCount,
-            gStraightTargetCount);
+        targetCountA = gStraightTargetCount;
+        targetCountB = gStraightTargetCount;
+        if (targetCountA > APP_MOTOR_TARGET_MAX_COUNTS) {
+            targetCountA = APP_MOTOR_TARGET_MAX_COUNTS;
+            targetCountB = APP_MOTOR_TARGET_MAX_COUNTS;
+        }
+
+        if (gDriveMode == DRIVE_TASK3_STRAIGHT) {
+            int32_t rawHeadingErrorMdeg = task3_heading_error_mdeg(
+                task3_departure_heading_mdeg(), relative_heading_mdeg());
+            int32_t headingErrorMdeg;
+            int32_t absoluteErrorMdeg;
+
+            gTask3StraightFilteredErrorMdeg +=
+                (rawHeadingErrorMdeg -
+                    gTask3StraightFilteredErrorMdeg) /
+                TASK3_STRAIGHT_ERROR_FILTER_DIVISOR;
+            headingErrorMdeg = gTask3StraightFilteredErrorMdeg;
+            absoluteErrorMdeg = (headingErrorMdeg < 0)
+                                    ? -headingErrorMdeg
+                                    : headingErrorMdeg;
+
+            if ((targetCountA >= TASK3_STRAIGHT_MIN_TARGET_COUNTS) &&
+                (absoluteErrorMdeg >
+                    TASK3_STRAIGHT_HEADING_DEADBAND_MDEG)) {
+                uint32_t correctionCounts = (uint32_t)
+                    (absoluteErrorMdeg -
+                        TASK3_STRAIGHT_HEADING_DEADBAND_MDEG +
+                        TASK3_STRAIGHT_MDEG_PER_COUNT - 1L) /
+                    TASK3_STRAIGHT_MDEG_PER_COUNT;
+                uint32_t maximumCorrection = targetCountA / 4U;
+
+                if (maximumCorrection >
+                    TASK3_STRAIGHT_MAX_CORRECTION_COUNTS) {
+                    maximumCorrection =
+                        TASK3_STRAIGHT_MAX_CORRECTION_COUNTS;
+                }
+                if (correctionCounts > maximumCorrection) {
+                    correctionCounts = maximumCorrection;
+                }
+
+                if (headingErrorMdeg > 0) {
+                    /* Need a left correction: slow Motor B (left wheel). */
+                    targetCountB = (uint16_t)
+                        (targetCountB - correctionCounts);
+                } else {
+                    /* Need a right correction: slow Motor A (right wheel). */
+                    targetCountA = (uint16_t)
+                        (targetCountA - correctionCounts);
+                }
+            }
+        }
+
+        motor_control_update_20ms(gMs, targetCountA, targetCountB);
         if (motor_control_stalled()) {
             stop_route(DRIVE_FAULT);
         }
@@ -1264,7 +1334,7 @@ static void drive_arc_5ms(void)
                 stop_route(DRIVE_FAULT);
             } else {
                 /* Accumulate the makeup axis: 180, 360, 540... degrees.
-                 * Odd arcs then add 40 deg left; even arcs subtract 40 deg
+                 * Odd arcs then add 20 deg left; even arcs subtract 20 deg
                  * right. Wrapped heading error makes 360 deg equal 0 deg. */
                 gTask3AxisTargetMdeg =
                     (int32_t) gTask3HalfArcCount * TASK3_HALF_TURN_MDEG;
