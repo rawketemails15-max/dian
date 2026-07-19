@@ -45,7 +45,7 @@
 #define SEGMENT_TIMEOUT_MS                  (29500U)
 #define TASK3_HALF_ARC_COUNT                (8U)
 #define TASK3_INITIAL_OFFSET_MDEG           (40000L)
-#define TASK3_POST_ARC_OFFSET_MDEG          (20000L)
+#define TASK3_POST_ARC_OFFSET_MDEG          (40000L)
 #define TASK3_HALF_TURN_MDEG                (180000L)
 #define TASK3_FULL_TURN_MDEG                (360000L)
 #define TASK3_HEADING_TOLERANCE_MDEG        (1500L)
@@ -53,16 +53,17 @@
 #define TASK3_TURN_FAST_PWM                 MOTOR_PWM_CRUISE
 #define TASK3_TURN_SLOW_PWM                 (1800U)
 #define TASK3_TURN_FINE_PWM                 (1600U)
-#define TASK3_STRAIGHT_HEADING_DEADBAND_MDEG (2500L)
-#define TASK3_STRAIGHT_MDEG_PER_COUNT       (5000L)
-#define TASK3_STRAIGHT_MAX_CORRECTION_COUNTS (2U)
-#define TASK3_STRAIGHT_MIN_TARGET_COUNTS    (10U)
-#define TASK3_STRAIGHT_ERROR_FILTER_DIVISOR (4L)
 
 #define MOTOR_PWM_PERIOD                    (8000)
 #define MOTOR_PWM_CRUISE                    (2300)
 
 #define OLED_UPDATE_PERIOD_MS               (100U)
+#define OLED_WIDTH_PIXELS                   (128U)
+#define OLED_LARGE_SCALE                    (6U)
+#define OLED_LARGE_FONT_HEIGHT              (7U)
+#define OLED_LARGE_FIRST_PAGE               (1U)
+#define OLED_LARGE_PAGE_COUNT               (6U)
+#define OLED_LARGE_TOP_PIXEL                (11U)
 
 /*
  * Field geometry target:
@@ -145,6 +146,13 @@
 #define MPU6050_FALLBACK_SAMPLE_MS          (5U)
 /* At +/-500 dps, 65.5 LSB/dps = 131/2 LSB/dps. */
 #define MPU6050_GYRO_SCALE_DENOMINATOR      (131L)
+#define MPU6050_RATE_FILTER_DIVISOR          (4L)
+#define MPU6050_STATIONARY_START_TICKS       (4U)
+#define MPU6050_STATIONARY_RATE_LIMIT_RAW    (131L)
+#define MPU6050_MIN_STATIONARY_SAMPLES       (8U)
+#define MPU6050_BIAS_INITIAL_VARIANCE        (4.0f)
+#define MPU6050_BIAS_PROCESS_VARIANCE        (1.0f)
+#define MPU6050_BIAS_SAMPLE_VARIANCE         (256.0f)
 
 #define MOTOR_A_PORT                        AIN_PORT
 #define MOTOR_AIN1_PIN                      AIN_AIN1_PIN
@@ -214,10 +222,14 @@ static uint32_t gPointLightStartMs;
 static uint8_t gTask3HalfArcCount;
 static uint8_t gTask3TurnSettleTicks;
 static int32_t gTask3AxisTargetMdeg;
-static int32_t gTask3StraightFilteredErrorMdeg;
 
 static bool gImuReady;
 static int32_t gGyroZBiasRaw;
+static float gGyroZBiasEstimateRaw;
+static float gGyroZBiasVariance;
+static int32_t gFilteredGyroZRaw;
+static int64_t gStationaryGyroZSum;
+static uint16_t gStationaryGyroZSamples;
 static int32_t gHeadingMdeg;
 static int32_t gHeadingRemainder;
 static uint32_t gImuLastSampleMs;
@@ -252,10 +264,10 @@ static int32_t task3_departure_heading_mdeg(void)
         /* A-to-C initial diagonal: 0 -> -40 deg is a right turn. */
         targetHeadingMdeg -= TASK3_INITIAL_OFFSET_MDEG;
     } else if ((gTask3HalfArcCount & 0x01U) != 0U) {
-        /* After C-to-B: 180 -> 200 deg is a left turn. */
+        /* After an odd half-circle, turn left 40 deg from line-loss heading. */
         targetHeadingMdeg += TASK3_POST_ARC_OFFSET_MDEG;
     } else {
-        /* After D-to-A: 360 -> 340 deg is a right turn. */
+        /* After an even half-circle, turn right 40 deg from line-loss heading. */
         targetHeadingMdeg -= TASK3_POST_ARC_OFFSET_MDEG;
     }
     return targetHeadingMdeg;
@@ -402,61 +414,135 @@ static void oled_init(void)
     oled_clear();
 }
 
-static const uint8_t *oled_glyph(char character)
+static const uint8_t *oled_large_glyph(
+    char character, uint8_t *glyphWidth)
 {
-    static const char characters[] = " 0123456789+-.:ADEGLN";
-    static const uint8_t glyphs[][5] = {
-        {0x00U, 0x00U, 0x00U, 0x00U, 0x00U},
-        {0x3EU, 0x51U, 0x49U, 0x45U, 0x3EU},
-        {0x00U, 0x42U, 0x7FU, 0x40U, 0x00U},
-        {0x42U, 0x61U, 0x51U, 0x49U, 0x46U},
-        {0x21U, 0x41U, 0x45U, 0x4BU, 0x31U},
-        {0x18U, 0x14U, 0x12U, 0x7FU, 0x10U},
-        {0x27U, 0x45U, 0x45U, 0x45U, 0x39U},
-        {0x3CU, 0x4AU, 0x49U, 0x49U, 0x30U},
-        {0x01U, 0x71U, 0x09U, 0x05U, 0x03U},
-        {0x36U, 0x49U, 0x49U, 0x49U, 0x36U},
-        {0x06U, 0x49U, 0x49U, 0x29U, 0x1EU},
-        {0x08U, 0x08U, 0x3EU, 0x08U, 0x08U},
-        {0x08U, 0x08U, 0x08U, 0x08U, 0x08U},
-        {0x00U, 0x60U, 0x60U, 0x00U, 0x00U},
-        {0x00U, 0x36U, 0x36U, 0x00U, 0x00U},
-        {0x7EU, 0x11U, 0x11U, 0x11U, 0x7EU},
-        {0x7FU, 0x41U, 0x41U, 0x22U, 0x1CU},
-        {0x7FU, 0x49U, 0x49U, 0x49U, 0x41U},
-        {0x3EU, 0x41U, 0x49U, 0x49U, 0x7AU},
-        {0x7FU, 0x40U, 0x40U, 0x40U, 0x40U},
-        {0x7FU, 0x02U, 0x0CU, 0x10U, 0x7FU},
+    static const char characters[] = "0123456789-.";
+    static const uint8_t glyphs[][3] = {
+        {0x7FU, 0x41U, 0x7FU},
+        {0x42U, 0x7FU, 0x40U},
+        {0x79U, 0x49U, 0x4FU},
+        {0x49U, 0x49U, 0x7FU},
+        {0x0FU, 0x08U, 0x7FU},
+        {0x4FU, 0x49U, 0x79U},
+        {0x7FU, 0x49U, 0x79U},
+        {0x01U, 0x01U, 0x7FU},
+        {0x7FU, 0x49U, 0x7FU},
+        {0x4FU, 0x49U, 0x7FU},
+        {0x08U, 0x08U, 0x08U},
+        {0x40U, 0x00U, 0x00U},
     };
+    static const uint8_t blankGlyph[3] = {0U, 0U, 0U};
 
     for (uint8_t index = 0U;
          index < (uint8_t) (sizeof(characters) - 1U); index++) {
         if (characters[index] == character) {
+            *glyphWidth = (character == '.') ? 1U : 3U;
             return glyphs[index];
         }
     }
-    return glyphs[0];
+    *glyphWidth = 3U;
+    return blankGlyph;
 }
 
-static void oled_write_text(uint8_t column, uint8_t page, const char *text)
+static uint8_t oled_large_text_width(const char *text)
 {
-    oled_set_position(column, page);
-    while (*text != '\0') {
-        const uint8_t *glyph = oled_glyph(*text++);
+    uint16_t width = 0U;
 
-        for (uint8_t glyphColumn = 0U; glyphColumn < 5U; glyphColumn++) {
-            oled_write_byte(glyph[glyphColumn], true);
+    while (*text != '\0') {
+        uint8_t glyphWidth;
+
+        (void) oled_large_glyph(*text++, &glyphWidth);
+        width += (uint16_t) glyphWidth * OLED_LARGE_SCALE;
+        if (*text != '\0') {
+            width += OLED_LARGE_SCALE;
         }
-        oled_write_byte(0U, true);
+    }
+    return (uint8_t) width;
+}
+
+static void oled_write_text_6x(const char *text)
+{
+    static uint8_t pixels[OLED_LARGE_PAGE_COUNT][OLED_WIDTH_PIXELS];
+    static uint8_t previousPixels[OLED_LARGE_PAGE_COUNT][OLED_WIDTH_PIXELS];
+    uint8_t textWidth = oled_large_text_width(text);
+    uint8_t x = (uint8_t) ((OLED_WIDTH_PIXELS - textWidth) / 2U);
+
+    for (uint8_t page = 0U; page < OLED_LARGE_PAGE_COUNT; page++) {
+        for (uint8_t column = 0U; column < OLED_WIDTH_PIXELS; column++) {
+            pixels[page][column] = 0U;
+        }
+    }
+
+    while (*text != '\0') {
+        uint8_t glyphWidth;
+        const uint8_t *glyph = oled_large_glyph(*text++, &glyphWidth);
+
+        for (uint8_t glyphColumn = 0U;
+             glyphColumn < glyphWidth; glyphColumn++) {
+            for (uint8_t xScale = 0U;
+                 xScale < OLED_LARGE_SCALE; xScale++) {
+                uint8_t outputX = (uint8_t) (x + xScale);
+
+                for (uint8_t glyphRow = 0U;
+                     glyphRow < OLED_LARGE_FONT_HEIGHT; glyphRow++) {
+                    if ((glyph[glyphColumn] &
+                            (uint8_t) (1U << glyphRow)) != 0U) {
+                        for (uint8_t yScale = 0U;
+                             yScale < OLED_LARGE_SCALE; yScale++) {
+                            uint8_t outputY = (uint8_t)
+                                (OLED_LARGE_TOP_PIXEL +
+                                    glyphRow * OLED_LARGE_SCALE + yScale);
+                            uint8_t outputPage =
+                                (uint8_t) (outputY / 8U);
+
+                            pixels[outputPage - OLED_LARGE_FIRST_PAGE]
+                                [outputX] |=
+                                (uint8_t) (1U << (outputY % 8U));
+                        }
+                    }
+                }
+            }
+            x = (uint8_t) (x + OLED_LARGE_SCALE);
+        }
+        if (*text != '\0') {
+            x = (uint8_t) (x + OLED_LARGE_SCALE);
+        }
+    }
+
+    for (uint8_t page = 0U; page < OLED_LARGE_PAGE_COUNT; page++) {
+        uint8_t firstChanged = OLED_WIDTH_PIXELS;
+        uint8_t lastChanged = 0U;
+
+        for (uint8_t column = 0U; column < OLED_WIDTH_PIXELS; column++) {
+            if (pixels[page][column] != previousPixels[page][column]) {
+                if (firstChanged == OLED_WIDTH_PIXELS) {
+                    firstChanged = column;
+                }
+                lastChanged = column;
+            }
+        }
+
+        if (firstChanged < OLED_WIDTH_PIXELS) {
+            oled_set_position(firstChanged,
+                (uint8_t) (OLED_LARGE_FIRST_PAGE + page));
+            for (uint8_t column = firstChanged;
+                 column <= lastChanged; column++) {
+                oled_write_byte(pixels[page][column], true);
+                previousPixels[page][column] = pixels[page][column];
+            }
+        }
     }
 }
 
 static void oled_update_angle(void)
 {
     static uint32_t lastUpdateMs;
-    char text[] = "ANGLE:+000.0 DEG";
+    char text[8];
     int32_t angleMdeg = relative_heading_mdeg();
     uint32_t angleTenths;
+    uint32_t wholeDegrees;
+    uint8_t textLength = 0U;
 
     if (!elapsed_ms(lastUpdateMs, OLED_UPDATE_PERIOD_MS)) {
         return;
@@ -464,20 +550,38 @@ static void oled_update_angle(void)
     lastUpdateMs = gMs;
 
     if (angleMdeg < 0) {
-        text[6] = '-';
         angleTenths = (uint32_t) ((-angleMdeg + 50L) / 100L);
     } else {
         angleTenths = (uint32_t) ((angleMdeg + 50L) / 100L);
     }
-    if (angleTenths > 9999U) {
+    if ((angleMdeg < 0) && (angleTenths > 9999U)) {
         angleTenths = 9999U;
+    } else if (angleTenths > 99999U) {
+        angleTenths = 99999U;
     }
 
-    text[7] = (char) ('0' + ((angleTenths / 1000U) % 10U));
-    text[8] = (char) ('0' + ((angleTenths / 100U) % 10U));
-    text[9] = (char) ('0' + ((angleTenths / 10U) % 10U));
-    text[11] = (char) ('0' + (angleTenths % 10U));
-    oled_write_text(16U, 3U, text);
+    if ((angleMdeg < 0) && (angleTenths != 0U)) {
+        text[textLength++] = '-';
+    }
+
+    wholeDegrees = angleTenths / 10U;
+    if (wholeDegrees >= 1000U) {
+        text[textLength++] = (char) ('0' + (wholeDegrees / 1000U));
+    }
+    if (wholeDegrees >= 100U) {
+        text[textLength++] =
+            (char) ('0' + ((wholeDegrees / 100U) % 10U));
+    }
+    if (wholeDegrees >= 10U) {
+        text[textLength++] =
+            (char) ('0' + ((wholeDegrees / 10U) % 10U));
+    }
+    text[textLength++] = (char) ('0' + (wholeDegrees % 10U));
+    text[textLength++] = '.';
+    text[textLength++] = (char) ('0' + (angleTenths % 10U));
+    text[textLength] = '\0';
+
+    oled_write_text_6x(text);
 }
 
 static void line_sensor_init(void)
@@ -749,10 +853,51 @@ static bool mpu6050_init_and_calibrate(void)
     }
 
     gGyroZBiasRaw = (int32_t) (biasSum / sampleCount);
+    gGyroZBiasEstimateRaw = (float) gGyroZBiasRaw;
+    gGyroZBiasVariance = MPU6050_BIAS_INITIAL_VARIANCE;
+    gFilteredGyroZRaw = 0;
+    gStationaryGyroZSum = 0;
+    gStationaryGyroZSamples = 0U;
     gHeadingMdeg = 0;
     gHeadingRemainder = 0;
     gImuLastSampleMs = gMs;
     return true;
+}
+
+static void imu_discard_stationary_bias_samples(void)
+{
+    gStationaryGyroZSum = 0;
+    gStationaryGyroZSamples = 0U;
+}
+
+static void imu_finalize_stationary_bias_update(void)
+{
+    if (gStationaryGyroZSamples >= MPU6050_MIN_STATIONARY_SAMPLES) {
+        float measurement = (float) gStationaryGyroZSum /
+            (float) gStationaryGyroZSamples;
+        float predictedVariance = gGyroZBiasVariance +
+            MPU6050_BIAS_PROCESS_VARIANCE;
+        float measurementVariance = MPU6050_BIAS_SAMPLE_VARIANCE /
+            (float) gStationaryGyroZSamples;
+        float kalmanGain = predictedVariance /
+            (predictedVariance + measurementVariance);
+
+        gGyroZBiasEstimateRaw += kalmanGain *
+            (measurement - gGyroZBiasEstimateRaw);
+        gGyroZBiasVariance = (1.0f - kalmanGain) * predictedVariance;
+        gGyroZBiasRaw = (int32_t) (gGyroZBiasEstimateRaw +
+            ((gGyroZBiasEstimateRaw >= 0.0f) ? 0.5f : -0.5f));
+    }
+    imu_discard_stationary_bias_samples();
+}
+
+static void imu_anchor_relative_heading(int32_t headingMdeg)
+{
+    gHeadingMdeg = gRouteZeroHeadingMdeg + headingMdeg;
+    gHeadingRemainder = 0;
+    gFilteredGyroZRaw = 0;
+    gImuLastSampleMs = gMs;
+    gImuDataReady = false;
 }
 
 static void imu_update_heading(void)
@@ -762,6 +907,8 @@ static void imu_update_heading(void)
     int16_t rawGyroZ;
     int32_t rateRaw;
     int32_t numerator;
+    int32_t absoluteRateRaw;
+    bool task3HeadingMode;
 
     if (!gImuReady ||
         (!gImuDataReady &&
@@ -783,7 +930,35 @@ static void imu_update_heading(void)
     }
 
     rateRaw = ((int32_t) rawGyroZ - gGyroZBiasRaw) * MPU6050_GYRO_Z_SIGN;
-    numerator = (rateRaw * (int32_t) deltaMs * 2) + gHeadingRemainder;
+    absoluteRateRaw = (rateRaw < 0) ? -rateRaw : rateRaw;
+    task3HeadingMode = (gDriveMode == DRIVE_TASK3_ALIGN_AXIS) ||
+        (gDriveMode == DRIVE_TASK3_ALIGN_OFFSET);
+
+    if (task3HeadingMode &&
+        (gTask3TurnSettleTicks >= MPU6050_STATIONARY_START_TICKS) &&
+        (absoluteRateRaw <= MPU6050_STATIONARY_RATE_LIMIT_RAW)) {
+        gStationaryGyroZSum += rawGyroZ;
+        if (gStationaryGyroZSamples < UINT16_MAX) {
+            gStationaryGyroZSamples++;
+        }
+        gFilteredGyroZRaw = 0;
+        gImuLastSampleMs = nowMs;
+        return;
+    }
+
+    if (!task3HeadingMode || (gTask3TurnSettleTicks == 0U)) {
+        imu_discard_stationary_bias_samples();
+    }
+
+    if (gRouteMission == ROUTE_MISSION_TASK3) {
+        gFilteredGyroZRaw +=
+            (rateRaw - gFilteredGyroZRaw) / MPU6050_RATE_FILTER_DIVISOR;
+    } else {
+        /* Preserve the original four-segment route's unfiltered integration. */
+        gFilteredGyroZRaw = rateRaw;
+    }
+    numerator = (gFilteredGyroZRaw * (int32_t) deltaMs * 2) +
+        gHeadingRemainder;
     gHeadingMdeg += numerator / MPU6050_GYRO_SCALE_DENOMINATOR;
     gHeadingRemainder = numerator % MPU6050_GYRO_SCALE_DENOMINATOR;
     gImuLastSampleMs = nowMs;
@@ -797,6 +972,8 @@ static void imu_reset_route_angle(void)
      */
     gHeadingMdeg = 0;
     gHeadingRemainder = 0;
+    gFilteredGyroZRaw = 0;
+    imu_discard_stationary_bias_samples();
     gRouteZeroHeadingMdeg = 0;
     gImuLastSampleMs = gMs;
     gImuDataReady = false;
@@ -808,6 +985,7 @@ static void imu_begin_arc_sampling(bool resetRouteAngle)
         imu_reset_route_angle();
     } else {
         /* Exclude the preceding straight section from the next integration. */
+        gFilteredGyroZRaw = 0;
         gImuLastSampleMs = gMs;
         gImuDataReady = false;
     }
@@ -978,6 +1156,7 @@ static void begin_arc(DriveMode arcMode)
 static void begin_task3_heading(DriveMode headingMode)
 {
     stop_car();
+    imu_discard_stationary_bias_samples();
     gTask3TurnSettleTicks = 0U;
     gSegmentStartMs = gMs;
     gDriveMode = headingMode;
@@ -985,7 +1164,6 @@ static void begin_task3_heading(DriveMode headingMode)
 
 static void begin_task3_straight(void)
 {
-    gTask3StraightFilteredErrorMdeg = 0;
     begin_straight(DRIVE_TASK3_STRAIGHT, false);
 }
 
@@ -1095,6 +1273,8 @@ static void drive_task3_heading_5ms(void)
             gTask3TurnSettleTicks++;
         }
         if (gTask3TurnSettleTicks >= TASK3_TURN_SETTLE_TICKS) {
+            imu_finalize_stationary_bias_update();
+            imu_anchor_relative_heading(targetHeadingMdeg);
             if (gDriveMode == DRIVE_TASK3_ALIGN_AXIS) {
                 begin_task3_heading(DRIVE_TASK3_ALIGN_OFFSET);
             } else {
@@ -1103,6 +1283,7 @@ static void drive_task3_heading_5ms(void)
         }
         return;
     }
+    imu_discard_stationary_bias_samples();
     gTask3TurnSettleTicks = 0U;
 
     if (absoluteErrorMdeg <= ARC_FORCE_TURN_FINE_ZONE_MDEG) {
@@ -1216,52 +1397,8 @@ static void drive_straight_5ms(void)
             targetCountB = APP_MOTOR_TARGET_MAX_COUNTS;
         }
 
-        if (gDriveMode == DRIVE_TASK3_STRAIGHT) {
-            int32_t rawHeadingErrorMdeg = task3_heading_error_mdeg(
-                task3_departure_heading_mdeg(), relative_heading_mdeg());
-            int32_t headingErrorMdeg;
-            int32_t absoluteErrorMdeg;
-
-            gTask3StraightFilteredErrorMdeg +=
-                (rawHeadingErrorMdeg -
-                    gTask3StraightFilteredErrorMdeg) /
-                TASK3_STRAIGHT_ERROR_FILTER_DIVISOR;
-            headingErrorMdeg = gTask3StraightFilteredErrorMdeg;
-            absoluteErrorMdeg = (headingErrorMdeg < 0)
-                                    ? -headingErrorMdeg
-                                    : headingErrorMdeg;
-
-            if ((targetCountA >= TASK3_STRAIGHT_MIN_TARGET_COUNTS) &&
-                (absoluteErrorMdeg >
-                    TASK3_STRAIGHT_HEADING_DEADBAND_MDEG)) {
-                uint32_t correctionCounts = (uint32_t)
-                    (absoluteErrorMdeg -
-                        TASK3_STRAIGHT_HEADING_DEADBAND_MDEG +
-                        TASK3_STRAIGHT_MDEG_PER_COUNT - 1L) /
-                    TASK3_STRAIGHT_MDEG_PER_COUNT;
-                uint32_t maximumCorrection = targetCountA / 4U;
-
-                if (maximumCorrection >
-                    TASK3_STRAIGHT_MAX_CORRECTION_COUNTS) {
-                    maximumCorrection =
-                        TASK3_STRAIGHT_MAX_CORRECTION_COUNTS;
-                }
-                if (correctionCounts > maximumCorrection) {
-                    correctionCounts = maximumCorrection;
-                }
-
-                if (headingErrorMdeg > 0) {
-                    /* Need a left correction: slow Motor B (left wheel). */
-                    targetCountB = (uint16_t)
-                        (targetCountB - correctionCounts);
-                } else {
-                    /* Need a right correction: slow Motor A (right wheel). */
-                    targetCountA = (uint16_t)
-                        (targetCountA - correctionCounts);
-                }
-            }
-        }
-
+        /* AC and BD use the same equal-target dual-encoder straight control
+         * as the first mission. Heading integration is paused separately. */
         motor_control_update_20ms(gMs, targetCountA, targetCountB);
         if (motor_control_stalled()) {
             stop_route(DRIVE_FAULT);
@@ -1333,9 +1470,9 @@ static void drive_arc_5ms(void)
             } else if (!gImuReady) {
                 stop_route(DRIVE_FAULT);
             } else {
-                /* Accumulate the makeup axis: 180, 360, 540... degrees.
-                 * Odd arcs then add 20 deg left; even arcs subtract 20 deg
-                 * right. Wrapped heading error makes 360 deg equal 0 deg. */
+                /* First restore the route axis: odd half-circles face the
+                 * initial direction's reverse, even half-circles face the
+                 * initial direction. Then offset 40 degrees for departure. */
                 gTask3AxisTargetMdeg =
                     (int32_t) gTask3HalfArcCount * TASK3_HALF_TURN_MDEG;
                 begin_task3_heading(DRIVE_TASK3_ALIGN_AXIS);
@@ -1528,8 +1665,9 @@ int main(void)
             key_scan_5ms();
             if ((gDriveMode == DRIVE_BC_ARC) ||
                 (gDriveMode == DRIVE_DA_ARC) ||
-                ((gRouteMission == ROUTE_MISSION_TASK3) &&
-                    route_is_active())) {
+                (gDriveMode == DRIVE_TASK3_ARC) ||
+                (gDriveMode == DRIVE_TASK3_ALIGN_AXIS) ||
+                (gDriveMode == DRIVE_TASK3_ALIGN_OFFSET)) {
                 imu_update_heading();
             }
             drive_tick_5ms();
