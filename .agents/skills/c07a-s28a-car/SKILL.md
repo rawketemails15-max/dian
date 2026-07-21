@@ -1,6 +1,6 @@
 ---
 name: c07a-s28a-car
-description: Grounded workflow for the C07A + S28A NUEDC control car using TI MSPM0G3507, CCS, SysConfig, MSPM0 SDK, DriverLib, K230 HiWonder CanMV/MicroPython, and bidirectional UART. Use when Codex inspects, creates, modifies, builds, flashes, debugs, or diagnoses this repository's MSPM0 firmware or .syscfg files; writes or diagnoses K230 camera, vision, display, touch, UART, or HMI code; configures GPIO, UART, I2C, SPI, timers, PWM, ADC, or interrupts; integrates the motors, encoders, LD-3015MG/LDX-227 gimbal servos, MPU6050, eight-channel grayscale sensor, OLED, K230, or power wiring; or checks C07A/S28A pinmux and board conflicts. Do not apply its board-specific pin assumptions to other MSPM0 boards.
+description: Grounded workflow for the C07A + S28A NUEDC control car using TI MSPM0G3507, CCS, SysConfig, MSPM0 SDK, DriverLib, K230 HiWonder CanMV/MicroPython, and bidirectional UART. Use when Codex inspects, creates, modifies, builds, flashes, debugs, or diagnoses this repository's MSPM0 firmware or .syscfg files; writes or diagnoses K230 camera, vision, display, touch, UART, or HMI code; configures GPIO, UART, I2C, SPI, timers, PWM, ADC, or interrupts; diagnoses dead PB16/PB17 PWM, boot recenter failures, or one-way K230/MSPM0 UART; integrates the motors, encoders, LD-3015MG/LDX-227 gimbal servos, MPU6050, eight-channel grayscale sensor, OLED, K230, or power wiring; or checks C07A/S28A pinmux and board conflicts. Do not apply its board-specific pin assumptions to other MSPM0 boards.
 ---
 
 # C07A + S28A Car
@@ -14,7 +14,7 @@ description: Grounded workflow for the C07A + S28A NUEDC control car using TI MS
 5. Treat C07A/S28A labels as board wiring facts, not as proof of TI peripheral names, generated macros, or SysConfig schema.
 6. Treat bundled external-module documents as evidence only for that module's electrical, mechanical, and signal behavior. Never copy their other-board pin maps, wrapper names, generated-looking macros, or SDK calls into this project without current-project evidence.
 
-Always read [references/source-priority.md](references/source-priority.md). For pin or connector work, also read [references/pinmux-summary.md](references/pinmux-summary.md) and [references/s28a-board-map.md](references/s28a-board-map.md). For UART behavior, control conventions, HMI, ISR structure, or bring-up work, read [references/project-architecture.md](references/project-architecture.md). For K230 CanMV/MicroPython, camera, display, vision, touch, UART, or HMI work, read [references/module-docs/k230/index.md](references/module-docs/k230/index.md). For either gimbal servo's power, PWM, wiring, connector, or mechanical work, read [references/module-docs/gimbal-servos.md](references/module-docs/gimbal-servos.md). For eight-channel grayscale wiring, timing, GPIO, or control work, read [references/module-docs/grayscale/index.md](references/module-docs/grayscale/index.md). For any `.syscfg`, generated-code, DriverLib, build, or debug work, read [references/sysconfig-workflow.md](references/sysconfig-workflow.md). Use [references/official/index.md](references/official/index.md) and [references/board-docs/index.md](references/board-docs/index.md) to locate the bundled TI and board documents.
+Always read [references/source-priority.md](references/source-priority.md). For pin or connector work, also read [references/pinmux-summary.md](references/pinmux-summary.md) and [references/s28a-board-map.md](references/s28a-board-map.md). For UART behavior, control conventions, HMI, ISR structure, or bring-up work, read [references/project-architecture.md](references/project-architecture.md). For K230 CanMV/MicroPython, camera, display, vision, touch, UART, or HMI work, read [references/module-docs/k230/index.md](references/module-docs/k230/index.md). For either gimbal servo's power, PWM, wiring, connector, or mechanical work, read [references/module-docs/gimbal-servos.md](references/module-docs/gimbal-servos.md). For a dead-at-boot gimbal, missing PB16/PB17 PWM, one-way K230/MSPM0 UART, `MSP RX:0`, or a failure introduced while merging servo and vision code, read and follow [references/gimbal-k230-uart-debugging.md](references/gimbal-k230-uart-debugging.md) before changing PID, CRC, or pin assignments. For eight-channel grayscale wiring, timing, GPIO, or control work, read [references/module-docs/grayscale/index.md](references/module-docs/grayscale/index.md). For any `.syscfg`, generated-code, DriverLib, build, or debug work, read [references/sysconfig-workflow.md](references/sysconfig-workflow.md). Use [references/official/index.md](references/official/index.md) and [references/board-docs/index.md](references/board-docs/index.md) to locate the bundled TI and board documents.
 
 If any CCS Project, SysConfig, Debug, or Serial MCP tool is missing, disconnected, or unexpectedly unavailable, read and follow [references/ccs-mcp-troubleshooting.md](references/ccs-mcp-troubleshooting.md) before blaming the project, editing configuration files, or switching to unsupported build/configuration paths.
 
@@ -94,16 +94,19 @@ When code builds but hardware does not respond, check in this order:
 9. Peripheral instance.
 10. Interrupt enable and handler path.
 
+For simultaneous gimbal-PWM and UART bring-up, read the startup and oscilloscope checklist in [references/gimbal-k230-uart-debugging.md](references/gimbal-k230-uart-debugging.md). A generated timer auto-start setting or successful build is not proof that the physical PWM pin has a waveform.
+
 Never describe compile success as hardware validation. State the last verified layer: source inspection, SysConfig generation, compilation, linking, flashing/debugging, or real-hardware behavior.
 
 ### H. When modifying K230 CanMV/MicroPython
 
 1. Identify and record the exact board revision, CanMV firmware/build, camera sensor, display/touch hardware, and required SD-card assets.
-2. Keep GPIO11/UART2_TXD and GPIO12/UART2_RXD fixed. Never copy UART1/GPIO3/GPIO4/LED52 from the bundled reference example or the board schematic's 40Pin TX1/RX1 route.
+2. Keep the current project route fixed: K230 40Pin pin 8 TX1(IO3)/UART1_TXD goes to MSPM0 PB7/UART1_RX, and MSPM0 PB6/UART1_TX goes to K230 40Pin pin 10 RX1(IO4)/UART1_RXD. Keep all grounds common. Do not restore the superseded GPIO11/GPIO12 UART2 route or copy the example's unrelated LED52 behavior.
 3. Obtain FPIOA, UART, Sensor, Display, MediaManager, image, and KPU API names from the installed firmware's matching documentation, runtime help, or a verified same-version example.
 4. Treat every bundled example as reference code with an unknown firmware version. Check missing models/assets, hard-coded thresholds, credentials, cleanup, blocking behavior, and host-side versus device-side role before reuse.
-5. Run syntax/import checks and then test peripheral initialization on the actual K230. Test UART loopback and MSPM0 interoperability before integrating vision or HMI traffic.
-6. State the last verified layer. Desktop syntax success is not CanMV execution, UART interoperability, camera validation, or on-car validation.
+5. For the known-tested `CanMV v1.4-19-ga7de1c8` UART1 RX pattern, explicitly configure IO4 input/output/pull/Schmitt attributes, use a read timeout long enough for the status frame, and print the live FPIOA configuration. Re-probe after firmware replacement and do not infer that selecting `UART1_RXD` alone established a working receive pad; follow [references/gimbal-k230-uart-debugging.md](references/gimbal-k230-uart-debugging.md).
+6. Run syntax/import checks and then test peripheral initialization on the actual K230. Test raw RX counts, RX-only mode, UART loopback, and MSPM0 interoperability before integrating vision or HMI traffic.
+7. State the last verified layer. Desktop syntax success is not CanMV execution, UART interoperability, camera validation, or on-car validation.
 
 ## Preserve project boundaries
 

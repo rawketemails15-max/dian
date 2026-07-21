@@ -15,8 +15,8 @@ These are project software and behavior conventions moved out of repository-root
 - Use bidirectional UART at 115200 baud, 8 data bits, no parity, and 1 stop bit.
 - Target a 30 Hz K230 vision-result transmission rate.
 - Do not require the K230 and MSPM0 UART peripheral numbers to match; follow each device's actual pinmux and generated configuration.
-- Keep K230 GPIO11/GPIO12 assigned to the project's intended UART2 TX/RX route. The bundled `UART.py` uses UART1 on GPIO3/GPIO4 and controls LED52; use it only as API-pattern evidence for its unknown firmware version.
-- Verify exact UART2/FPIOA names against the installed CanMV firmware before writing code. Do not infer them by changing `UART1` to `UART2` in the example.
+- Keep K230 40Pin pin 8 TX1(IO3)/UART1_TXD and pin 10 RX1(IO4)/UART1_RXD assigned to the project UART route. Cross TX/RX to MSPM0 PB7/PB6 respectively and keep all grounds common. The former GPIO11/GPIO12 UART2 route is superseded.
+- A known-tested CanMV runtime confirmed `FPIOA.UART1_TXD`, `FPIOA.UART1_RXD`, and `UART.UART1` for a prior integrated build. Re-run runtime introspection on the active device and after any firmware change; the bundled `UART.py` alone is not version proof, and its LED52 behavior is unrelated.
 - Separate UART receive/transmit buffering from the camera loop. Define framing, length/checking, timeouts, recovery, and command/result ownership before treating the suggested command names below as a wire protocol.
 
 ## Control conventions
@@ -35,6 +35,17 @@ These are project software and behavior conventions moved out of repository-root
 - Do not perform blocking I2C transactions inside the GPIO ISR.
 - Keep both installed gimbal servos within their documented 50~330 Hz and 500~2500 us capability. Preserve an existing valid project frequency; if none exists, make the frequency an explicit configuration decision rather than inferring the active timer setup from a datasheet.
 - Begin both axes at the 1500 us midpoint and expand the commanded range gradually while checking mechanical interference. Both manufacturer documents say that increasing pulse width commands counterclockwise shaft rotation, but verify each installed linkage's resulting PAN/TILT direction independently. Read [the gimbal servo reference](module-docs/gimbal-servos.md) for model and connector differences.
+
+For a prior real-hardware-verified gimbal-plus-UART build, the following startup order was known-good. Re-derive every instance and API from the active generated files and installed SDK before porting it:
+
+1. Run the generated system initialization.
+2. Initialize protocol and gimbal state, write both safe 1500 us midpoint values, then explicitly start both PWM counters with the active generated instances and verified DriverLib APIs.
+3. Clear and start the control timebase and enable its IRQ before communication IRQs.
+4. Drain the UART RX FIFO, clear peripheral and NVIC pending state, then enable the UART IRQ last.
+
+Keep the disconnected UART RX pin pulled to the idle-high state and give the control timebase higher interrupt priority than UART reception. A SysConfig/generated `startTimer` setting and a successful build are configuration evidence, not proof of a physical waveform. For a dead-at-boot gimbal, check PB16/PB17 for continuous 50 Hz PWM and the configured midpoint high time, PB7 for a stable idle-high level, and PB6 for periodic status bursts. This separates PWM-counter startup, application liveness, and UART interrupt/noise faults before changing PID signs or gains. Use final disassembly to confirm actual start calls and ordering when needed, but report only oscilloscope or actuator observations as hardware validation.
+
+For the complete symptom-to-evidence decision tree, the historical real-hardware-verified K230 IO4 receive configuration, RX-only diagnostic, representative status bytes, and merged PWM/UART startup lessons, read [K230 UART and gimbal PWM bring-up](gimbal-k230-uart-debugging.md).
 
 ## Local display and controls
 

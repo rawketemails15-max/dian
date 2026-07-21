@@ -33,8 +33,8 @@ Source abbreviations used in every row:
 | PA8, LQFP-48 pin 16 | Grayscale AD1 | GPIO output, channel-address bit | H §6; D Table 6-2; C; S |
 | PA22, LQFP-48 pin 40 | Grayscale AD0 | GPIO output, channel-address bit | H §6; D Table 6-2; C; S |
 | PA18, LQFP-48 pin 33 | BLS push button | GPIO input; external 47 kOhm pull-down to GND, press connects to 3V3, active high | C; U |
-| PB17, LQFP-48 pin 36 | TILT servo PWM | TIMA1_C0; route confirmed by current 48-pin SysConfig and generated header | H §5; D Table 6-2; C; S |
-| PB16, LQFP-48 pin 26 | PAN servo PWM | TIMG7_C1; route confirmed by current 48-pin SysConfig and generated header | H §5; D Table 6-2; C; S |
+| PB17, LQFP-48 pin 36 | TILT servo PWM | TIMA1_C0; route confirmed by a previously verified 48-pin SysConfig/generated header and must be re-established in the active project | H §5; D Table 6-2; C; S |
+| PB16, LQFP-48 pin 26 | PAN servo PWM | TIMG7_C1; route confirmed by a previously verified 48-pin SysConfig/generated header and must be re-established in the active project | H §5; D Table 6-2; C; S |
 | PA12, LQFP-48 pin 27 | Grayscale AD2 | GPIO output, channel-address bit | H §6; D Table 6-2; C; S |
 | PA27, LQFP-48 pin 47 | Grayscale OUT | GPIO input. The module OUT is a digital signal with a project-confirmed maximum of 3.3 V; do not configure PA27 as ADC for this module. | H §6; D Table 6-2; C; S; M |
 | PA28, LQFP-48 pin 3 | Existing OLED signal | GPIO reserved for existing OLED; exact signal role comes from the existing driver/project | H §7; D Table 6-2; C; S |
@@ -43,8 +43,8 @@ Source abbreviations used in every row:
 | PB15, LQFP-48 pin 25 | Existing OLED signal | GPIO reserved for existing OLED; exact signal role comes from the existing driver/project | H §7; D Table 6-2; C; S |
 | PB8, LQFP-48 pin 22 | Reserved/broken-out IO, not the BLS button used by this project | GPIO-capable pin; BLS is fixed to PA18 | D Table 6-2; C; U |
 | PB9, LQFP-48 pin 23 | On-board status LED | GPIO output | H §8; D Table 6-2; C; S |
-| PA24, LQFP-48 pin 44 | Reserved ultrasonic interface | GPIO reserved; do not allocate to radar or another permanent module | H §9; D Table 6-2; C; S |
-| PA9, LQFP-48 pin 17 | Active-high buzzer control | GPIO output; drive high to sound and low to silence | H §8; D Table 6-2; C; S; U |
+| PA24, LQFP-48 pin 44 | Remaining ultrasonic reservation | GPIO reserved; the original two-pin ultrasonic interface is incomplete while PA9 drives the buzzer | H §9; D Table 6-2; C; S |
+| PA9, LQFP-48 pin 17 | Active-high buzzer control | GPIO output; user explicitly reassigned this former ultrasonic signal | H §8-9; D Table 6-2; C; S; U |
 
 ## Boundaries
 
