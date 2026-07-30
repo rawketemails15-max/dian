@@ -29,10 +29,33 @@ static bool gMotionTimerStarted;
 static bool gSequenceTimedOut;
 static uint32_t gReturnToLevelStartMs;
 static int32_t gCenterFilteredVelocity;
-static int32_t gCenterIntegralAccumulator;
+static int32_t gCenterReferenceSteps;
+static int32_t gCenterBiasSteps;
+static uint32_t gCenterLastErrorMagnitudeQ4;
+static uint32_t gCenterRecoveryStartMs;
+static uint32_t gCenterLastForcedActionMs;
 static uint8_t gCenterStableFrames;
-static uint8_t gCenterStuckFrames;
+static uint8_t gCenterNoProgressFrames;
+static uint8_t gCenterArmFrames;
+static uint8_t gCenterRecoveryPhase;
+static int8_t gCenterRecoverySign;
+static int8_t gCenterLastCorrectionSign;
+static uint16_t gCenterTiltLimit;
+static uint16_t gCenterRunId;
+static uint16_t gEventCounter;
+static uint8_t gLastEvent;
 static bool gCenterSettled;
+static bool gCenterCandidate;
+static bool gCenterMustCorrect;
+static bool gCenterApproaching;
+static bool gCenterHaveRealError;
+static bool gCenterHaveCorrectionSign;
+static bool gCenterForcedActionSeen;
+static bool gCenterFineMode;
+static bool gCenterForceCooldown;
+static bool gCenterRecoveryRealFramePermit;
+static bool gCenterAtLimit;
+static bool gVisionFaultReported;
 
 static bool gButtonRaw;
 static bool gButtonStable;
@@ -87,10 +110,36 @@ static void reset_position_pid(uint32_t nowMs)
 static void reset_center_hold_state(void)
 {
     gCenterFilteredVelocity = 0;
-    gCenterIntegralAccumulator = 0;
+    gCenterReferenceSteps = gCurrentSteps;
+    gCenterBiasSteps = 0;
+    gCenterLastErrorMagnitudeQ4 = 0U;
+    gCenterRecoveryStartMs = 0U;
+    gCenterLastForcedActionMs = 0U;
     gCenterStableFrames = 0U;
-    gCenterStuckFrames = 0U;
+    gCenterNoProgressFrames = 0U;
+    gCenterArmFrames = 0U;
+    gCenterRecoveryPhase = BALL_CENTER_RECOVERY_NONE;
+    gCenterRecoverySign = 0;
+    gCenterLastCorrectionSign = 0;
+    gCenterTiltLimit = APP_BALL_CENTER_INITIAL_TILT_STEPS;
     gCenterSettled = false;
+    gCenterCandidate = false;
+    gCenterMustCorrect = false;
+    gCenterApproaching = false;
+    gCenterHaveRealError = false;
+    gCenterHaveCorrectionSign = false;
+    gCenterForcedActionSeen = false;
+    gCenterFineMode = false;
+    gCenterForceCooldown = false;
+    gCenterRecoveryRealFramePermit = false;
+    gCenterAtLimit = false;
+    gVisionFaultReported = false;
+}
+
+static void publish_status_event(BallStatusEvent event)
+{
+    gLastEvent = (uint8_t) event;
+    gEventCounter++;
 }
 
 static void stop_and_hold_current_position(void)
@@ -213,10 +262,17 @@ static void select_center_mode(uint32_t nowMs)
     gMotionTimerStarted = false;
     gSequenceTimedOut = false;
     gCommandFrequencyHz = APP_BALL_SPEED_NEAR_HZ;
+    gCenterLastForcedActionMs =
+        nowMs - APP_BALL_CENTER_FORCED_ACTION_MS;
+    gCenterRunId++;
+    publish_status_event(BALL_STATUS_EVENT_CENTER_START);
 }
 
 static void start_motion_sequence(uint32_t nowMs)
 {
+    if (gMotionPhase == BALL_MOTION_HOLD_CENTER) {
+        publish_status_event(BALL_STATUS_EVENT_DOUBLE_CLICK_OVERRIDE);
+    }
     stop_and_hold_current_position();
     reset_position_pid(nowMs);
     reset_center_hold_state();
@@ -266,215 +322,391 @@ static void service_operation_button(uint32_t nowMs, bool pressed)
     }
 }
 
-static void update_center_hold_target(const BallVisionSample *vision)
+static int32_t center_absolute_target(int32_t relativeTarget)
 {
-    int32_t x = (int32_t) ((vision->xQ4 + 8U) >> 4U);
-    int32_t error = APP_BALL_IMAGE_CENTER_X - x;
-    int32_t desiredTarget;
-    int32_t targetChange;
-    uint32_t errorMagnitude = absolute_i32(error);
-    uint32_t velocityMagnitude;
-    bool predicted =
-        (vision->flags & BALL_VISION_FLAG_PREDICTED) != 0U;
-    bool insideCenterBand;
-    bool speedSettled;
-    bool rodAtTarget;
-    bool holdingSettled;
+    int32_t limitedRelative = clamp_i32(relativeTarget,
+        -(int32_t) gCenterTiltLimit, (int32_t) gCenterTiltLimit);
+    int32_t requested = gCenterReferenceSteps + limitedRelative;
+    int32_t limited = clamp_i32(
+        requested, APP_BALL_MIN_STEPS, APP_BALL_MAX_STEPS);
 
-    gCenterFilteredVelocity +=
-        ((int32_t) vision->velocityX - gCenterFilteredVelocity) /
-        APP_BALL_CENTER_VELOCITY_FILTER_DIVISOR;
-    velocityMagnitude = absolute_i32(gCenterFilteredVelocity);
-    insideCenterBand =
-        errorMagnitude <= APP_BALL_CENTER_DEADBAND_PX;
-    speedSettled =
-        velocityMagnitude <= APP_BALL_CENTER_SETTLE_SPEED_PX_S;
+    gCenterAtLimit = (limited != requested);
+    return limited;
+}
+
+static void command_center_relative(int32_t relativeTarget, bool immediate)
+{
+    int32_t desiredTarget = center_absolute_target(relativeTarget);
+
+    if (immediate) {
+        gTargetSteps = desiredTarget;
+    } else {
+        int32_t targetChange = clamp_i32(desiredTarget - gTargetSteps,
+            -APP_BALL_TARGET_SLEW_STEPS_PER_FRAME,
+            APP_BALL_TARGET_SLEW_STEPS_PER_FRAME);
+
+        gTargetSteps = clamp_i32(gTargetSteps + targetChange,
+            APP_BALL_MIN_STEPS, APP_BALL_MAX_STEPS);
+    }
+}
+
+static void begin_center_recovery(uint32_t nowMs, int8_t sign)
+{
+    gCenterRecoveryPhase = BALL_CENTER_RECOVERY_BACKOFF;
+    gCenterRecoverySign = sign;
+    gCenterRecoveryStartMs = nowMs;
+    gCenterLastForcedActionMs = nowMs;
+    gCenterForcedActionSeen = true;
+    command_center_relative(sign *
+        ((int32_t) gCenterTiltLimit -
+            APP_BALL_CENTER_RECOVERY_BACKOFF_STEPS), true);
+    publish_status_event(BALL_STATUS_EVENT_RECOVERY_BACKOFF);
+}
+
+static void cancel_center_recovery(void)
+{
+    gCenterRecoveryPhase = BALL_CENTER_RECOVERY_NONE;
+    gCenterRecoverySign = 0;
+    gCenterForceCooldown = false;
+}
+
+static void service_center_recovery(uint32_t nowMs)
+{
+    bool rodAtTarget;
+
+    if (gCenterRecoveryPhase == BALL_CENTER_RECOVERY_NONE) {
+        return;
+    }
+    if (gCenterRecoveryPhase == BALL_CENTER_RECOVERY_LEVELING) {
+        gCommandFrequencyHz = APP_BALL_CENTER_LEVEL_HZ;
+        command_center_relative(0, true);
+        if (absolute_i32(gCurrentSteps - gCenterReferenceSteps) <=
+            APP_BALL_POSITION_TOLERANCE_STEPS) {
+            gCenterRecoveryPhase = BALL_CENTER_RECOVERY_NONE;
+            gCenterRecoverySign = 0;
+            gCommandFrequencyHz = APP_BALL_SPEED_NEAR_HZ;
+        }
+        return;
+    }
+    if (!gCenterRecoveryRealFramePermit) {
+        return;
+    }
+    gCenterRecoveryRealFramePermit = false;
     rodAtTarget =
         absolute_i32(gTargetSteps - gCurrentSteps) <=
         APP_BALL_POSITION_TOLERANCE_STEPS;
-    holdingSettled = gCenterSettled &&
-        (errorMagnitude <= APP_BALL_CENTER_RELEASE_PX) &&
-        (velocityMagnitude <= APP_BALL_CENTER_RELEASE_SPEED_PX_S);
-
-    if (insideCenterBand) {
-        gCenterIntegralAccumulator = 0;
-        gCenterStuckFrames = 0U;
+    if (!rodAtTarget ||
+        !elapsed_ms(nowMs, gCenterRecoveryStartMs,
+            APP_BALL_CENTER_RECOVERY_INTERVAL_MS)) {
+        return;
     }
 
-    /*
-     * Once settled, keep the rod level through small detector jitter.  A
-     * genuine position or velocity disturbance leaves this wider hysteresis
-     * band and re-enables the same closed-loop correction without another
-     * button press.
-     */
-    if (holdingSettled) {
-        desiredTarget = 0;
-        gCommandFrequencyHz = APP_BALL_SPEED_NEAR_HZ;
+    gCenterRecoveryStartMs = nowMs;
+    gCenterLastForcedActionMs = nowMs;
+    if (gCenterRecoveryPhase == BALL_CENTER_RECOVERY_BACKOFF) {
+        gCenterRecoveryPhase = BALL_CENTER_RECOVERY_REAPPLY;
+        command_center_relative(
+            gCenterRecoverySign * (int32_t) gCenterTiltLimit, true);
+        publish_status_event(BALL_STATUS_EVENT_RECOVERY_REAPPLY);
     } else {
-        int32_t proportional;
-        int32_t damping;
-        int32_t baseTarget;
-
-        if (gCenterSettled) {
-            gCenterSettled = false;
-            gCenterStableFrames = 0U;
-        }
-
-        if (insideCenterBand && speedSettled) {
-            /*
-             * Reaching x=160 is not sufficient: remove the residual rod
-             * angle while the ball is slow, then require the physical step
-             * position to reach level before declaring it settled.
-             */
-            desiredTarget = 0;
-            gCommandFrequencyHz = APP_BALL_SPEED_NEAR_HZ;
-        } else {
-            if (errorMagnitude <= APP_BALL_SPEED_NEAR_ERROR_PX) {
-                gCommandFrequencyHz = APP_BALL_SPEED_NEAR_HZ;
-            } else if (errorMagnitude <=
-                APP_BALL_SPEED_MEDIUM_ERROR_PX) {
-                gCommandFrequencyHz = APP_BALL_SPEED_MEDIUM_HZ;
-            } else {
-                gCommandFrequencyHz = APP_BALL_SPEED_FAR_HZ;
-            }
-
-            /*
-             * A real frame can prove that the ball is stationary and that
-             * the motor has reached the previous request.  Predicted frames
-             * keep the short-term PD output alive, but never confirm a stuck
-             * ball and never modify the retry integral.
-             */
-            if (!predicted) {
-                if (speedSettled && rodAtTarget) {
-                    if (gCenterStuckFrames <
-                        APP_BALL_CENTER_STUCK_REAL_FRAMES) {
-                        gCenterStuckFrames++;
-                    }
-                } else {
-                    gCenterStuckFrames = 0U;
-                    if (!speedSettled) {
-                        int32_t decay =
-                            gCenterIntegralAccumulator /
-                            APP_BALL_CENTER_INTEGRAL_DECAY_DIVISOR;
-
-                        if (decay == 0) {
-                            gCenterIntegralAccumulator = 0;
-                        } else {
-                            gCenterIntegralAccumulator -= decay;
-                        }
-                    }
-                }
-            }
-
-            proportional =
-                (error * APP_BALL_POSITION_KP_NUMERATOR) /
-                APP_BALL_POSITION_KP_DIVISOR;
-            damping =
-                (-gCenterFilteredVelocity *
-                    APP_BALL_POSITION_KD_NUMERATOR) /
-                APP_BALL_POSITION_KD_DIVISOR;
-            baseTarget = proportional + damping;
-
-            if (!predicted && speedSettled && rodAtTarget &&
-                (gCenterStuckFrames >=
-                    APP_BALL_CENTER_STUCK_REAL_FRAMES)) {
-                int32_t candidateAccumulator = clamp_i32(
-                    gCenterIntegralAccumulator + error,
-                    -APP_BALL_CENTER_INTEGRAL_LIMIT,
-                    APP_BALL_CENTER_INTEGRAL_LIMIT);
-
-                /*
-                 * Clamp the accumulator against the remaining part of the
-                 * +/-60-step control-angle budget.  This lets the retry term
-                 * reach saturation once, but never wind farther toward the
-                 * much wider +/-238-step software travel boundary.
-                 */
-                if (error > 0) {
-                    int32_t maximumAccumulator =
-                        (APP_BALL_ANGLE_TARGET_LIMIT_STEPS - baseTarget) *
-                        APP_BALL_CENTER_INTEGRAL_DIVISOR;
-
-                    if (gCenterIntegralAccumulator <
-                        maximumAccumulator) {
-                        if (candidateAccumulator >
-                            maximumAccumulator) {
-                            candidateAccumulator = maximumAccumulator;
-                        }
-                        gCenterIntegralAccumulator =
-                            candidateAccumulator;
-                    }
-                } else {
-                    int32_t minimumAccumulator =
-                        (-APP_BALL_ANGLE_TARGET_LIMIT_STEPS - baseTarget) *
-                        APP_BALL_CENTER_INTEGRAL_DIVISOR;
-
-                    if (gCenterIntegralAccumulator >
-                        minimumAccumulator) {
-                        if (candidateAccumulator <
-                            minimumAccumulator) {
-                            candidateAccumulator = minimumAccumulator;
-                        }
-                        gCenterIntegralAccumulator =
-                            candidateAccumulator;
-                    }
-                }
-            }
-
-            desiredTarget = baseTarget +
-                (gCenterIntegralAccumulator /
-                    APP_BALL_CENTER_INTEGRAL_DIVISOR);
-
-            /*
-             * Near center the damping term can intentionally reverse the
-             * requested tilt to brake the ball.  Preserve the sign of the
-             * final PD command rather than forcing the position-error sign.
-             */
-            if ((desiredTarget != 0) &&
-                (absolute_i32(desiredTarget) <
-                    APP_BALL_MIN_EFFECTIVE_TILT_STEPS)) {
-                desiredTarget = (desiredTarget > 0) ?
-                    APP_BALL_MIN_EFFECTIVE_TILT_STEPS :
-                    -APP_BALL_MIN_EFFECTIVE_TILT_STEPS;
-            }
-        }
+        gCenterRecoveryPhase = BALL_CENTER_RECOVERY_BACKOFF;
+        command_center_relative(gCenterRecoverySign *
+            ((int32_t) gCenterTiltLimit -
+                APP_BALL_CENTER_RECOVERY_BACKOFF_STEPS), true);
+        publish_status_event(BALL_STATUS_EVENT_RECOVERY_BACKOFF);
     }
+}
 
-    desiredTarget = clamp_i32(desiredTarget,
-        -APP_BALL_ANGLE_TARGET_LIMIT_STEPS,
-        APP_BALL_ANGLE_TARGET_LIMIT_STEPS);
-    desiredTarget = clamp_i32(desiredTarget,
-        APP_BALL_MIN_STEPS, APP_BALL_MAX_STEPS);
-    targetChange = clamp_i32(desiredTarget - gTargetSteps,
-        -APP_BALL_TARGET_SLEW_STEPS_PER_FRAME,
-        APP_BALL_TARGET_SLEW_STEPS_PER_FRAME);
-    gTargetSteps = clamp_i32(gTargetSteps + targetChange,
-        APP_BALL_MIN_STEPS, APP_BALL_MAX_STEPS);
+static void update_center_hold_target(
+    const BallVisionSample *vision, uint32_t nowMs)
+{
+    int32_t errorQ4 =
+        APP_BALL_IMAGE_CENTER_Q4 - (int32_t) vision->xQ4;
+    int32_t x = (int32_t) ((vision->xQ4 + 8U) >> 4U);
+    uint32_t errorMagnitudeQ4 = absolute_i32(errorQ4);
+    uint32_t errorMagnitudePx = errorMagnitudeQ4 >> 4U;
+    bool predicted =
+        (vision->flags & BALL_VISION_FLAG_PREDICTED) != 0U;
+    bool realFrame = !predicted;
+    bool rodAtTarget =
+        absolute_i32(gTargetSteps - gCurrentSteps) <=
+        APP_BALL_POSITION_TOLERANCE_STEPS;
+    bool positionApproaching = false;
+    bool velocityApproaching;
+    int32_t proportional;
+    int32_t damping;
+    int32_t desiredRelative;
+    int8_t correctionSign = (errorQ4 >= 0) ? 1 : -1;
+    bool crossedCenter = false;
+
+    if (realFrame) {
+        gCenterRecoveryRealFramePermit = true;
+    }
+    gCenterFilteredVelocity +=
+        ((int32_t) vision->velocityX - gCenterFilteredVelocity) /
+        APP_BALL_CENTER_VELOCITY_FILTER_DIVISOR;
+    velocityApproaching =
+        (absolute_i32(gCenterFilteredVelocity) >=
+            APP_BALL_CENTER_SETTLE_SPEED_PX_S) &&
+        (((errorQ4 > 0) && (gCenterFilteredVelocity > 0)) ||
+         ((errorQ4 < 0) && (gCenterFilteredVelocity < 0)));
+    if (realFrame && gCenterHaveRealError &&
+        (errorMagnitudeQ4 + APP_BALL_CENTER_PROGRESS_Q4 <=
+            gCenterLastErrorMagnitudeQ4)) {
+        positionApproaching = true;
+    }
+    gCenterApproaching =
+        realFrame && (positionApproaching || velocityApproaching);
 
     /*
-     * Predicted K230 frames remain useful for one-frame control continuity,
-     * but only real detections can advance the stable confirmation count.
+     * Only a real detector frame can enter or leave the settled state.
+     * |errorQ4|=60 may continue holding, while 61 immediately resumes
+     * correction.  Predicted frames never advance arming, settling, or stuck
+     * recovery counters.
      */
-    if (!predicted) {
-        if (insideCenterBand && speedSettled &&
-            (absolute_i32(gTargetSteps) <=
-                APP_BALL_POSITION_TOLERANCE_STEPS) &&
-            (absolute_i32(gCurrentSteps) <=
-                APP_BALL_POSITION_TOLERANCE_STEPS)) {
+    if (realFrame) {
+        if (errorMagnitudeQ4 >= APP_BALL_CENTER_MUST_CORRECT_Q4) {
+            crossedCenter = gCenterHaveCorrectionSign &&
+                (correctionSign != gCenterLastCorrectionSign);
+            gCenterLastCorrectionSign = correctionSign;
+            gCenterHaveCorrectionSign = true;
+            if ((gCenterSettled || gCenterCandidate) &&
+                !crossedCenter) {
+                publish_status_event(
+                    BALL_STATUS_EVENT_CORRECTION_RESUME);
+            }
+            gCenterSettled = false;
+            gCenterCandidate = false;
+            gCenterStableFrames = 0U;
+            gCenterMustCorrect = true;
+        } else {
+            gCenterMustCorrect = false;
+            gCenterNoProgressFrames = 0U;
+            if (gCenterRecoveryPhase !=
+                BALL_CENTER_RECOVERY_LEVELING) {
+                cancel_center_recovery();
+            }
+        }
+
+        if (errorMagnitudeQ4 <= APP_BALL_CENTER_SETTLE_ERROR_Q4) {
+            if (!gCenterCandidate) {
+                stop_and_hold_current_position();
+                gCenterCandidate = true;
+                gCenterStableFrames = 0U;
+            }
             if (gCenterStableFrames <
                 APP_BALL_CENTER_STABLE_REAL_FRAMES) {
                 gCenterStableFrames++;
             }
-            if (gCenterStableFrames >=
-                APP_BALL_CENTER_STABLE_REAL_FRAMES) {
+            gCenterNoProgressFrames = 0U;
+            cancel_center_recovery();
+            if (!gCenterSettled &&
+                (gCenterStableFrames >=
+                    APP_BALL_CENTER_STABLE_REAL_FRAMES)) {
                 gCenterSettled = true;
+                gCenterReferenceSteps = gCurrentSteps;
+                gCenterBiasSteps = 0;
+                gCenterFineMode = true;
+                gCenterTiltLimit = APP_BALL_CENTER_FINE_TILT_STEPS;
+                publish_status_event(
+                    BALL_STATUS_EVENT_CENTER_SETTLED);
             }
         } else {
+            gCenterCandidate = false;
             gCenterStableFrames = 0U;
         }
     }
 
+    if (gCenterSettled && !gCenterMustCorrect) {
+        stop_and_hold_current_position();
+        gCommandFrequencyHz = APP_BALL_SPEED_NEAR_HZ;
+        goto center_sample_done;
+    }
+    if (gCenterCandidate) {
+        stop_and_hold_current_position();
+        gCommandFrequencyHz = APP_BALL_SPEED_NEAR_HZ;
+        goto center_sample_done;
+    }
+
+    /*
+     * A real sign reversal means the ball crossed the red line.  Discard all
+     * learned force from the old side and request the new braking direction
+     * immediately instead of slewing through a stale +/-48..120-step target.
+     */
+    if (realFrame && crossedCenter) {
+        cancel_center_recovery();
+        gCenterBiasSteps = 0;
+        gCenterNoProgressFrames = 0U;
+        gCenterFineMode =
+            errorMagnitudeQ4 <= APP_BALL_CENTER_FINE_ZONE_Q4;
+        gCenterTiltLimit = gCenterFineMode ?
+            APP_BALL_CENTER_FINE_TILT_STEPS :
+            APP_BALL_CENTER_INITIAL_TILT_STEPS;
+        gCommandFrequencyHz = APP_BALL_CENTER_CROSS_HZ;
+        command_center_relative(
+            correctionSign * APP_BALL_CENTER_CROSS_TILT_STEPS, true);
+        gCenterLastForcedActionMs = nowMs;
+        gCenterForcedActionSeen = true;
+        gCenterForceCooldown = true;
+        publish_status_event(BALL_STATUS_EVENT_CORRECTION_RESUME);
+        goto center_sample_done;
+    }
+
+    /*
+     * Once a distant ball reaches the conservative fine zone while moving
+     * toward the line, remove the learned tilt and level the rod first.
+     * The physical rod must reach the button-time reference before the
+     * low-speed +/-24-step fine controller is allowed to resume.
+     */
+    if (realFrame && !gCenterFineMode &&
+        (errorMagnitudeQ4 <= APP_BALL_CENTER_FINE_ZONE_Q4) &&
+        gCenterApproaching) {
+        cancel_center_recovery();
+        gCenterFineMode = true;
+        gCenterTiltLimit = APP_BALL_CENTER_FINE_TILT_STEPS;
+        gCenterBiasSteps = 0;
+        gCenterNoProgressFrames = 0U;
+        gCenterRecoveryPhase = BALL_CENTER_RECOVERY_LEVELING;
+        gCenterRecoveryStartMs = nowMs;
+        gCommandFrequencyHz = APP_BALL_CENTER_LEVEL_HZ;
+        command_center_relative(0, true);
+        publish_status_event(BALL_STATUS_EVENT_CENTER_LEVELING);
+        goto center_sample_done;
+    }
+
+    if (realFrame && gCenterFineMode &&
+        (errorMagnitudeQ4 > APP_BALL_CENTER_FINE_ZONE_Q4)) {
+        cancel_center_recovery();
+        gCenterFineMode = false;
+        gCenterTiltLimit = APP_BALL_CENTER_INITIAL_TILT_STEPS;
+        gCenterBiasSteps = 0;
+        gCenterNoProgressFrames = 0U;
+        gCenterForcedActionSeen = false;
+    }
+
+    if (gCenterRecoveryPhase == BALL_CENTER_RECOVERY_LEVELING) {
+        gCommandFrequencyHz = APP_BALL_CENTER_LEVEL_HZ;
+        command_center_relative(0, true);
+        goto center_sample_done;
+    }
+
+    if (gCenterApproaching) {
+        gCenterNoProgressFrames = 0U;
+        if (gCenterBiasSteps > 0) {
+            gCenterBiasSteps -= APP_BALL_CENTER_BIAS_DECAY_STEPS;
+            if (gCenterBiasSteps < 0) {
+                gCenterBiasSteps = 0;
+            }
+        } else if (gCenterBiasSteps < 0) {
+            gCenterBiasSteps += APP_BALL_CENTER_BIAS_DECAY_STEPS;
+            if (gCenterBiasSteps > 0) {
+                gCenterBiasSteps = 0;
+            }
+        }
+        if ((gCenterRecoveryPhase == BALL_CENTER_RECOVERY_BACKOFF) ||
+            (gCenterRecoveryPhase == BALL_CENTER_RECOVERY_REAPPLY)) {
+            cancel_center_recovery();
+        }
+    } else if (realFrame && gCenterMustCorrect && rodAtTarget) {
+        if (gCenterNoProgressFrames <
+            APP_BALL_CENTER_NO_PROGRESS_FRAMES) {
+            gCenterNoProgressFrames++;
+        }
+    } else if (realFrame) {
+        gCenterNoProgressFrames = 0U;
+    }
+    if (gCenterForceCooldown &&
+        elapsed_ms(nowMs, gCenterLastForcedActionMs,
+            APP_BALL_CENTER_FORCED_ACTION_MS)) {
+        gCenterForceCooldown = false;
+    }
+
+    if (gCenterFineMode) {
+        gCommandFrequencyHz = APP_BALL_SPEED_NEAR_HZ;
+    } else if (errorMagnitudePx <= APP_BALL_SPEED_NEAR_ERROR_PX) {
+        gCommandFrequencyHz = APP_BALL_SPEED_NEAR_HZ;
+    } else if (errorMagnitudePx <= APP_BALL_SPEED_MEDIUM_ERROR_PX) {
+        gCommandFrequencyHz = APP_BALL_SPEED_MEDIUM_HZ;
+    } else {
+        gCommandFrequencyHz = APP_BALL_SPEED_FAR_HZ;
+    }
+
+    proportional =
+        ((errorQ4 * APP_BALL_POSITION_KP_NUMERATOR) /
+            APP_BALL_POSITION_KP_DIVISOR) / 16;
+    damping =
+        (-gCenterFilteredVelocity *
+            APP_BALL_POSITION_KD_NUMERATOR) /
+        APP_BALL_POSITION_KD_DIVISOR;
+    desiredRelative = proportional + damping + gCenterBiasSteps;
+    if (gCenterMustCorrect &&
+        ((desiredRelative * correctionSign) <
+            APP_BALL_MIN_EFFECTIVE_TILT_STEPS)) {
+        desiredRelative =
+            correctionSign * APP_BALL_MIN_EFFECTIVE_TILT_STEPS;
+    }
+
+    if (realFrame && gCenterMustCorrect &&
+        (gCenterNoProgressFrames >=
+            APP_BALL_CENTER_NO_PROGRESS_FRAMES) &&
+        (gCenterRecoveryPhase == BALL_CENTER_RECOVERY_NONE) &&
+        (!gCenterForcedActionSeen ||
+         elapsed_ms(nowMs, gCenterLastForcedActionMs,
+             APP_BALL_CENTER_FORCED_ACTION_MS))) {
+        bool alreadyAtMaximum;
+        int32_t relativeCurrent =
+            gCurrentSteps - gCenterReferenceSteps;
+
+        gCenterNoProgressFrames = 0U;
+        if (!gCenterFineMode &&
+            (gCenterTiltLimit < APP_BALL_CENTER_MAX_TILT_STEPS)) {
+            gCenterTiltLimit +=
+                APP_BALL_CENTER_TILT_INCREMENT_STEPS;
+            if (gCenterTiltLimit >
+                APP_BALL_CENTER_MAX_TILT_STEPS) {
+                gCenterTiltLimit =
+                    APP_BALL_CENTER_MAX_TILT_STEPS;
+            }
+        }
+        alreadyAtMaximum =
+            absolute_i32(relativeCurrent) >=
+                (gCenterTiltLimit -
+                    APP_BALL_POSITION_TOLERANCE_STEPS);
+
+        if (alreadyAtMaximum &&
+            (gCenterRecoveryPhase == BALL_CENTER_RECOVERY_NONE)) {
+            begin_center_recovery(nowMs, correctionSign);
+        } else {
+            gCenterBiasSteps = clamp_i32(
+                gCenterBiasSteps +
+                    correctionSign * APP_BALL_CENTER_NUDGE_STEPS,
+                -(int32_t) gCenterTiltLimit,
+                (int32_t) gCenterTiltLimit);
+            /*
+             * This direct four-microstep request is the hard guarantee that a
+             * stationary >=3 mm error cannot leave target==current.
+             */
+            command_center_relative(relativeCurrent +
+                correctionSign * APP_BALL_CENTER_NUDGE_STEPS, true);
+            gCenterLastForcedActionMs = nowMs;
+            gCenterForcedActionSeen = true;
+            gCenterForceCooldown = true;
+            publish_status_event(
+                BALL_STATUS_EVENT_RECOVERY_REAPPLY);
+        }
+    } else if (gCenterRecoveryPhase == BALL_CENTER_RECOVERY_NONE) {
+        command_center_relative(desiredRelative, false);
+    }
+
+center_sample_done:
+    if (realFrame) {
+        gCenterLastErrorMagnitudeQ4 = errorMagnitudeQ4;
+        gCenterHaveRealError = true;
+    }
     gTelemetry.ballX = (int16_t) x;
-    gTelemetry.ballError = (int16_t) error;
+    gTelemetry.ballError =
+        (int16_t) (errorQ4 / 16);
+    gTelemetry.ballErrorQ4 = (int16_t) errorQ4;
 }
 
 static void service_return_to_level(uint32_t nowMs)
@@ -687,6 +919,9 @@ void ball_rod_init(uint32_t nowMs)
     gPositionPidLastError = 0;
     gPositionPidFilteredDerivative = 0;
     gPositionPidLastMs = nowMs;
+    gCenterRunId = 0U;
+    gEventCounter = 0U;
+    gLastEvent = BALL_STATUS_EVENT_NONE;
     reset_center_hold_state();
     gButtonRaw = false;
     gButtonStable = false;
@@ -726,6 +961,13 @@ void ball_rod_init(uint32_t nowMs)
 void ball_rod_tick_5ms(
     uint32_t nowMs, bool buttonPressed, const BallVisionSample *vision)
 {
+    bool predicted =
+        (vision->flags & BALL_VISION_FLAG_PREDICTED) != 0U;
+    bool newVisionFrame = vision->received &&
+        (!gHaveVisionSequence ||
+            (vision->sequence != gLastVisionSequence));
+    bool centerMode = gMotionPhase == BALL_MOTION_HOLD_CENTER;
+
     gTelemetry.crcErrors = vision->crcErrors;
     gTelemetry.sequenceDrops = vision->sequenceDrops;
     gTelemetry.rxOverflows = vision->rxOverflows;
@@ -741,17 +983,33 @@ void ball_rod_tick_5ms(
     }
 #else
     service_operation_button(nowMs, buttonPressed);
-    if (vision->received &&
-        (!gHaveVisionSequence ||
-         (vision->sequence != gLastVisionSequence))) {
+    centerMode = gMotionPhase == BALL_MOTION_HOLD_CENTER;
+    if (newVisionFrame) {
         gLastVisionSequence = vision->sequence;
         gHaveVisionSequence = true;
+        if (centerMode) {
+            if (vision->valid && !predicted) {
+                if (gCenterArmFrames <
+                    APP_BALL_CENTER_ARM_REAL_FRAMES) {
+                    gCenterArmFrames++;
+                }
+            } else if (!vision->valid) {
+                gCenterArmFrames = 0U;
+                gCenterStableFrames = 0U;
+                gCenterCandidate = false;
+                gCenterNoProgressFrames = 0U;
+                gCenterRecoveryRealFramePermit = false;
+            }
+        }
         if (vision->valid &&
             (gMotionPhase != BALL_MOTION_IDLE) &&
             (gMotionPhase != BALL_MOTION_RETURN_TO_LEVEL) &&
             (gTelemetry.state != BALL_ROD_SAFETY_FAULT)) {
             if (gMotionPhase == BALL_MOTION_HOLD_CENTER) {
-                update_center_hold_target(vision);
+                if (gCenterArmFrames >=
+                    APP_BALL_CENTER_ARM_REAL_FRAMES) {
+                    update_center_hold_target(vision, nowMs);
+                }
             } else {
                 update_pid_target(vision);
             }
@@ -761,7 +1019,12 @@ void ball_rod_tick_5ms(
     if (!gDriverEnabled) {
         if ((gMotionPhase != BALL_MOTION_IDLE) &&
             vision->valid &&
-            (vision->validStreak >= APP_BALL_VALID_FRAMES_TO_ARM)) {
+            ((centerMode &&
+                (gCenterArmFrames >=
+                    APP_BALL_CENTER_ARM_REAL_FRAMES)) ||
+             (!centerMode &&
+                (vision->validStreak >=
+                    APP_BALL_VALID_FRAMES_TO_ARM)))) {
             set_direction_for_sign(1);
             DL_GPIO_setPins(GPIO_D36A_EN_PORT, GPIO_D36A_EN_EN_PIN);
             gDriverEnabled = true;
@@ -777,6 +1040,30 @@ void ball_rod_tick_5ms(
         }
     } else if (gTelemetry.state == BALL_ROD_SAFETY_FAULT) {
         /* Keep STEP stopped and PA24 high so the rod remains locked. */
+    } else if (centerMode) {
+        if (!vision->received ||
+            elapsed_ms(nowMs, vision->lastValidMs,
+                APP_BALL_VISION_FAULT_MS)) {
+            /*
+             * With no angle encoder, returning to software step zero is not a
+             * safe response to lost vision.  Stop STEP and retain the last
+             * physical rod angle with PA24 still high.
+             */
+            stop_and_hold_current_position();
+            gTelemetry.state = BALL_ROD_VISION_FAULT;
+            if (!gVisionFaultReported) {
+                gVisionFaultReported = true;
+                publish_status_event(
+                    BALL_STATUS_EVENT_VISION_FAULT);
+            }
+        } else if (elapsed_ms(nowMs, vision->lastValidMs,
+                       APP_BALL_VISION_RETURN_MS)) {
+            stop_and_hold_current_position();
+            gTelemetry.state = BALL_ROD_RETURNING;
+        } else {
+            gTelemetry.state = BALL_ROD_ACTIVE;
+            gVisionFaultReported = false;
+        }
     } else if (!vision->received ||
         elapsed_ms(nowMs, vision->lastValidMs,
             APP_BALL_VISION_FAULT_MS)) {
@@ -807,10 +1094,16 @@ void ball_rod_tick_5ms(
 
     if (gTelemetry.state == BALL_ROD_ACTIVE) {
         service_return_to_level(nowMs);
+        if (centerMode) {
+            service_center_recovery(nowMs);
+        }
     }
 
     if (gDriverEnabled &&
-        elapsed_ms(nowMs, gEnableStartMs, APP_D36A_WAKE_DELAY_MS)) {
+        elapsed_ms(nowMs, gEnableStartMs, APP_D36A_WAKE_DELAY_MS) &&
+        (!centerMode ||
+            (gCenterArmFrames >=
+                APP_BALL_CENTER_ARM_REAL_FRAMES))) {
         move_toward_target();
     }
 #endif
@@ -827,6 +1120,29 @@ void ball_rod_tick_5ms(
     gTelemetry.stepFrequencyHz = gStepFrequencyHz;
     gTelemetry.stepRunning = gStepRunning;
     gTelemetry.sequenceTimedOut = gSequenceTimedOut;
+    gTelemetry.driverEnabled = gDriverEnabled;
+    gTelemetry.visionFresh = vision->received &&
+        !elapsed_ms(nowMs, vision->lastValidMs,
+            APP_BALL_VISION_RETURN_MS);
+    gTelemetry.centerSettled = gCenterSettled;
+    gTelemetry.mustCorrect = gCenterMustCorrect;
+    gTelemetry.approachingCenter = gCenterApproaching;
+    gTelemetry.recoveryActive =
+        (gCenterRecoveryPhase != BALL_CENTER_RECOVERY_NONE) ||
+        gCenterForceCooldown;
+    gTelemetry.limitReached = gCenterAtLimit ||
+        ((gCenterTiltLimit != 0U) &&
+            (absolute_i32(gCurrentSteps - gCenterReferenceSteps) >=
+                (gCenterTiltLimit -
+                    APP_BALL_POSITION_TOLERANCE_STEPS)));
+    gTelemetry.filteredVelocity =
+        (int16_t) gCenterFilteredVelocity;
+    gTelemetry.runId = gCenterRunId;
+    gTelemetry.tiltLimit = gCenterTiltLimit;
+    gTelemetry.eventCounter = gEventCounter;
+    gTelemetry.recoveryPhase = gCenterRecoveryPhase;
+    gTelemetry.armFrames = gCenterArmFrames;
+    gTelemetry.event = gLastEvent;
 }
 
 void ball_rod_step_isr(void)

@@ -108,6 +108,8 @@ static uint8_t gButtonRaw;
 static uint8_t gButtonStable;
 static uint32_t gButtonRawChangedMs;
 static uint32_t gBallLedLastToggleMs;
+static uint32_t gBallLastStatusMs;
+static uint16_t gBallLastEventCounter;
 
 static bool elapsed_ms(uint32_t startMs, uint32_t durationMs)
 {
@@ -615,6 +617,10 @@ static void __attribute__((unused)) ball_static_tick_5ms(void)
 {
     BallVisionSample vision;
     BallRodTelemetry telemetry;
+    BallStatusFrame status;
+    uint16_t flags = 0U;
+    bool eventPending;
+    bool periodicDue;
     bool buttonPressed =
         ((DL_GPIO_readPins(KEY_PORT, KEY_key_PIN) & KEY_key_PIN) != 0U) ==
         (APP_BUTTON_ACTIVE_LEVEL != 0U);
@@ -623,6 +629,67 @@ static void __attribute__((unused)) ball_static_tick_5ms(void)
     vision = ball_protocol_get_sample();
     ball_rod_tick_5ms(gMs, buttonPressed, &vision);
     telemetry = ball_rod_get_telemetry();
+
+    eventPending =
+        telemetry.eventCounter != gBallLastEventCounter;
+    periodicDue =
+        elapsed_ms(gBallLastStatusMs, APP_BALL_STATUS_PERIOD_MS);
+    if (eventPending || periodicDue) {
+        if (telemetry.driverEnabled) {
+            flags |= BALL_STATUS_FLAG_DRIVER_ENABLED;
+        }
+        if (telemetry.stepRunning) {
+            flags |= BALL_STATUS_FLAG_STEP_RUNNING;
+        }
+        if (telemetry.visionFresh) {
+            flags |= BALL_STATUS_FLAG_VISION_FRESH;
+        }
+        if (telemetry.centerSettled) {
+            flags |= BALL_STATUS_FLAG_SETTLED;
+        }
+        if (telemetry.mustCorrect) {
+            flags |= BALL_STATUS_FLAG_MUST_CORRECT;
+        }
+        if (telemetry.approachingCenter) {
+            flags |= BALL_STATUS_FLAG_APPROACHING;
+        }
+        if (telemetry.recoveryActive) {
+            flags |= BALL_STATUS_FLAG_RECOVERY;
+        }
+        if (telemetry.limitReached) {
+            flags |= BALL_STATUS_FLAG_AT_LIMIT;
+        }
+        if (telemetry.sequenceTimedOut) {
+            flags |= BALL_STATUS_FLAG_SEQUENCE_LATE;
+        }
+
+        status.runId = telemetry.runId;
+        status.mspMs = gMs;
+        status.state = (uint8_t) telemetry.state;
+        status.motionPhase = (uint8_t) telemetry.motionPhase;
+        status.flags = flags;
+        status.currentSteps = (int16_t) telemetry.currentSteps;
+        status.targetSteps = (int16_t) telemetry.targetSteps;
+        status.errorQ4 = telemetry.ballErrorQ4;
+        status.filteredVelocity = telemetry.filteredVelocity;
+        status.stepHz = telemetry.stepFrequencyHz;
+        status.tiltLimit = telemetry.tiltLimit;
+        status.recoveryPhase = telemetry.recoveryPhase;
+        status.armFrames = telemetry.armFrames;
+        status.crcErrors = (uint16_t) telemetry.crcErrors;
+        status.sequenceDrops =
+            (uint16_t) telemetry.sequenceDrops;
+        status.rxOverflows = (uint16_t) telemetry.rxOverflows;
+        status.event = eventPending ? telemetry.event :
+            BALL_STATUS_EVENT_NONE;
+        if (ball_protocol_queue_status(&status)) {
+            gBallLastStatusMs = gMs;
+            if (eventPending) {
+                gBallLastEventCounter =
+                    telemetry.eventCounter;
+            }
+        }
+    }
     ball_led_service(telemetry.state);
     ball_oled_service();
 }
@@ -983,6 +1050,8 @@ int main(void)
     gControlTicksPending = 0U;
     __enable_irq();
     gLastOledUpdateMs = (uint32_t) (0U - APP_OLED_UPDATE_MS);
+    gBallLastStatusMs = 0U;
+    gBallLastEventCounter = 0U;
 
     while (1) {
         if (take_control_tick()) {

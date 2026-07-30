@@ -25,6 +25,13 @@ typedef enum {
     BALL_MOTION_HOLD_NEGATIVE_5CM
 } BallMotionPhase;
 
+typedef enum {
+    BALL_CENTER_RECOVERY_NONE = 0,
+    BALL_CENTER_RECOVERY_BACKOFF,
+    BALL_CENTER_RECOVERY_REAPPLY,
+    BALL_CENTER_RECOVERY_LEVELING
+} BallCenterRecoveryPhase;
+
 typedef struct {
     BallRodState state;
     BallMotionPhase motionPhase;
@@ -38,6 +45,21 @@ typedef struct {
     uint8_t directionLevel;
     bool stepRunning;
     bool sequenceTimedOut;
+    bool driverEnabled;
+    bool visionFresh;
+    bool centerSettled;
+    bool mustCorrect;
+    bool approachingCenter;
+    bool recoveryActive;
+    bool limitReached;
+    int16_t ballErrorQ4;
+    int16_t filteredVelocity;
+    uint16_t runId;
+    uint16_t tiltLimit;
+    uint16_t eventCounter;
+    uint8_t recoveryPhase;
+    uint8_t armFrames;
+    uint8_t event;
     uint32_t crcErrors;
     uint32_t sequenceDrops;
     uint32_t rxOverflows;

@@ -48,7 +48,7 @@ AP_PASSWORD = "12345678"
 AP_READY_TIMEOUT_MS = 10000
 AP_POLL_INTERVAL_MS = 200
 BOOT_SETTLE_MS = 3000
-SCRIPT_VERSION = "steel-ball-full-v3-uart-center"
+SCRIPT_VERSION = "steel-ball-full-v3-uart-center-log3-brake"
 BOOT_LOG_PATH = "/sdcard/wifi_rtsp.log"
 BOOT_LOG_MAX_BYTES = 32768
 
@@ -128,7 +128,23 @@ UART_BAUD_RATE = 115200
 UART_SEND_INTERVAL_MS = 33
 UART_PROTOCOL_VERSION = 0x01
 UART_MESSAGE_BALL_X = 0x03
+UART_MESSAGE_MSP_STATUS = 0x83
+UART_STATUS_PAYLOAD_SIZE = 36
+UART_STATUS_FRAME_SIZE = 43
 UART_BALL_CENTER_X = 160
+
+BALL_LOG_DIRECTORY = "/sdcard/ball_logs"
+BALL_LOG_PRETRIGGER_MS = 1000
+BALL_LOG_FLUSH_ROWS = 20
+BALL_LOG_FLUSH_MS = 1000
+BALL_LOG_SETTLED_CLOSE_MS = 3000
+BALL_LOG_MAX_RUN_MS = 60000
+BALL_CENTER_Q4 = 2560
+BALL_CENTER_SETTLE_Q4 = 40
+BALL_CENTER_MUST_CORRECT_Q4 = 61
+BALL_CENTER_STABLE_FRAMES = 15
+BALL_CENTER_ARM_FRAMES = 5
+BALL_MM_PER_PIXEL = 250.0 / 320.0
 
 # Keep this False until the servos use an external regulated 5 V supply and
 # the external supply GND is connected to K230 GND. Set True after wiring.
@@ -416,7 +432,7 @@ class UdpBallSender:
 
 
 class BallUartSender:
-    """Send the latest X coordinate as a fixed CRC-protected binary frame."""
+    """Bidirectional CRC-framed link between K230 and MSPM0."""
 
     def __init__(self):
         self.uart = None
@@ -427,6 +443,18 @@ class BallUartSender:
         )
         self.sent = 0
         self.failures = 0
+        self.last_vision_sequence = 0
+        self.rx_buffer = bytearray()
+        self.latest_status = None
+        self.status_frames = 0
+        self.status_crc_errors = 0
+        self.status_format_errors = 0
+        self.status_sequence_drops = 0
+        self.status_resets = 0
+        self.status_raw_bytes = 0
+        self.have_status_sequence = False
+        self.last_status_sequence = 0
+        self.last_status_msp_ms = None
 
         try:
             fpioa = FPIOA()
@@ -533,6 +561,7 @@ class BallUartSender:
         frame[13] = crc & 0xFF
         frame[14] = (crc >> 8) & 0xFF
 
+        self.last_vision_sequence = self.sequence
         self.sequence = (self.sequence + 1) & 0xFFFF
         if self.uart is None:
             return
@@ -542,6 +571,174 @@ class BallUartSender:
         except Exception:
             self.failures += 1
 
+    @staticmethod
+    def _u16(data, index):
+        return data[index] | (data[index + 1] << 8)
+
+    @classmethod
+    def _i16(cls, data, index):
+        value = cls._u16(data, index)
+        return value - 65536 if value & 0x8000 else value
+
+    @staticmethod
+    def _u32(data, index):
+        return (
+            data[index]
+            | (data[index + 1] << 8)
+            | (data[index + 2] << 16)
+            | (data[index + 3] << 24)
+        )
+
+    def _discard_rx(self, count):
+        """CanMV bytearray has no CPython-style item deletion."""
+        if count <= 0:
+            return
+        if count >= len(self.rx_buffer):
+            self.rx_buffer = bytearray()
+        else:
+            self.rx_buffer = bytearray(self.rx_buffer[count:])
+
+    def _decode_status(self, frame):
+        sequence = self._u16(frame, 5)
+        msp_ms = self._u32(frame, 9)
+        msp_reset = (
+            self.last_status_msp_ms is not None
+            and msp_ms + 100 < self.last_status_msp_ms
+        )
+        if msp_reset:
+            self.status_resets += 1
+            self.have_status_sequence = False
+
+        if self.have_status_sequence:
+            expected = (self.last_status_sequence + 1) & 0xFFFF
+            if sequence != expected:
+                self.status_sequence_drops += (
+                    sequence - expected
+                ) & 0xFFFF
+        self.have_status_sequence = True
+        self.last_status_sequence = sequence
+        self.last_status_msp_ms = msp_ms
+
+        flags = self._u16(frame, 15)
+        status = {
+            "sequence": sequence,
+            "run_id": self._u16(frame, 7),
+            "msp_ms": msp_ms,
+            "msp_reset": 1 if msp_reset else 0,
+            "status_resets": self.status_resets,
+            "state": frame[13],
+            "phase": frame[14],
+            "flags": flags,
+            "current_steps": self._i16(frame, 17),
+            "target_steps": self._i16(frame, 19),
+            "error_q4": self._i16(frame, 21),
+            "filtered_velocity": self._i16(frame, 23),
+            "step_hz": self._u16(frame, 25),
+            "tilt_limit": self._u16(frame, 27),
+            "recovery_phase": frame[29],
+            "arm_frames": frame[30],
+            "crc_errors": self._u16(frame, 31),
+            "sequence_drops": self._u16(frame, 33),
+            "rx_overflows": self._u16(frame, 35),
+            "tx_drops": self._u16(frame, 37),
+            "event": frame[39],
+            "en": 1 if flags & 0x0001 else 0,
+            "step_running": 1 if flags & 0x0002 else 0,
+            "vision_fresh": 1 if flags & 0x0004 else 0,
+            "settled": 1 if flags & 0x0008 else 0,
+            "must_correct": 1 if flags & 0x0010 else 0,
+            "approaching": 1 if flags & 0x0020 else 0,
+            "recovery": 1 if flags & 0x0040 else 0,
+            "at_limit": 1 if flags & 0x0080 else 0
+        }
+        status["received_ms"] = time.ticks_ms()
+        current_steps = status["current_steps"]
+        target_steps = status["target_steps"]
+        status["dir"] = (
+            1 if target_steps > current_steps
+            else (-1 if target_steps < current_steps else 0)
+        )
+        return status
+
+    def poll_status(self):
+        events = []
+        if self.uart is None:
+            return events
+
+        try:
+            data = self.uart.read()
+        except Exception:
+            self.status_format_errors += 1
+            return events
+
+        if data:
+            self.status_raw_bytes += len(data)
+            self.rx_buffer.extend(data)
+            if len(self.rx_buffer) > 512:
+                self.rx_buffer = bytearray(self.rx_buffer[-128:])
+                self.status_format_errors += 1
+
+        while len(self.rx_buffer) >= 2:
+            if (
+                self.rx_buffer[0] != 0xA5
+                or self.rx_buffer[1] != 0x5A
+            ):
+                header_index = -1
+                for index in range(1, len(self.rx_buffer) - 1):
+                    if (
+                        self.rx_buffer[index] == 0xA5
+                        and self.rx_buffer[index + 1] == 0x5A
+                    ):
+                        header_index = index
+                        break
+                if header_index < 0:
+                    keep_last = self.rx_buffer[-1] == 0xA5
+                    self.rx_buffer = (
+                        bytearray([0xA5])
+                        if keep_last
+                        else bytearray()
+                    )
+                    self.status_format_errors += 1
+                    break
+                self._discard_rx(header_index)
+                self.status_format_errors += 1
+
+            if len(self.rx_buffer) < 5:
+                break
+            if (
+                self.rx_buffer[2] != UART_PROTOCOL_VERSION
+                or self.rx_buffer[3] != UART_MESSAGE_MSP_STATUS
+                or self.rx_buffer[4] != UART_STATUS_PAYLOAD_SIZE
+            ):
+                self._discard_rx(1)
+                self.status_format_errors += 1
+                continue
+            if len(self.rx_buffer) < UART_STATUS_FRAME_SIZE:
+                break
+
+            frame = self.rx_buffer[:UART_STATUS_FRAME_SIZE]
+            received_crc = (
+                frame[41] | (frame[42] << 8)
+            )
+            calculated_crc = self._crc16_ccitt_false(
+                frame,
+                2,
+                39
+            )
+            if received_crc != calculated_crc:
+                self._discard_rx(1)
+                self.status_crc_errors += 1
+                continue
+
+            self._discard_rx(UART_STATUS_FRAME_SIZE)
+            status = self._decode_status(frame)
+            self.latest_status = status
+            self.status_frames += 1
+            if status["event"] or status["msp_reset"]:
+                events.append(status)
+
+        return events
+
     def close(self):
         if self.uart is not None:
             try:
@@ -549,6 +746,391 @@ class BallUartSender:
             except Exception:
                 pass
         self.uart = None
+
+
+class BallRunLogger:
+    """Buffered one-run CSV logger; every SD failure is non-fatal."""
+
+    EVENT_NAMES = {
+        1: "CENTER_START",
+        2: "CENTER_SETTLED",
+        3: "CORRECTION_RESUME",
+        4: "RECOVERY_BACKOFF",
+        5: "RECOVERY_REAPPLY",
+        6: "VISION_FAULT",
+        7: "CENTER_END",
+        8: "DOUBLE_CLICK_OVERRIDE",
+        9: "CENTER_LEVELING"
+    }
+    CSV_HEADER = (
+        "run_ms,event,vision_seq,real/pred/lost,"
+        "x_q4,x_px,y_px,vx,confidence,"
+        "msp_ms,status_sequence,run_id,state,phase,error_q4,"
+        "filtered_velocity,current_steps,target_steps,"
+        "step_hz,dir,en,step_running,vision_fresh,settled,"
+        "must_correct,approaching,recovery_phase,tilt_limit,"
+        "crc_errors,sequence_drops,rx_overflows,tx_drops,"
+        "status_crc_errors,status_format_errors,"
+        "status_sequence_drops,status_resets\n"
+    )
+
+    def __init__(self):
+        self.file = None
+        self.path = None
+        self.active = False
+        self.run_start_ms = 0
+        self.run_id = 0
+        self.buffer = []
+        self.pretrigger = []
+        self.last_flush_ms = time.ticks_ms()
+        self.settled_since_ms = None
+        self.last_seen_run_id = 0
+
+    @staticmethod
+    def _status_copy(status):
+        return status.copy() if status is not None else {}
+
+    def _snapshot(self, now_ms, motion, uart_link, event_text=""):
+        return (
+            now_ms,
+            motion,
+            uart_link.last_vision_sequence,
+            self._status_copy(uart_link.latest_status),
+            event_text,
+            uart_link.status_crc_errors,
+            uart_link.status_format_errors,
+            uart_link.status_sequence_drops,
+            uart_link.status_resets
+        )
+
+    @staticmethod
+    def _field(status, name):
+        value = status.get(name, "")
+        return value
+
+    def _format_row(self, sample):
+        (
+            sample_ms,
+            motion,
+            vision_sequence,
+            status,
+            event_text,
+            status_crc_errors,
+            status_format_errors,
+            status_sequence_drops,
+            status_resets
+        ) = sample
+        run_ms = time.ticks_diff(sample_ms, self.run_start_ms)
+
+        if motion is None:
+            vision_kind = "lost"
+            x_q4 = ""
+            x_px = ""
+            y_px = ""
+            velocity_x = ""
+            confidence = ""
+        else:
+            vision_kind = "pred" if motion[4] <= 0.0 else "real"
+            x_q4 = int(motion[0] * 16.0 + 0.5)
+            x_px = "%.3f" % motion[0]
+            y_px = "%.3f" % motion[1]
+            velocity_x = "%.3f" % motion[2]
+            confidence = "%.4f" % motion[4]
+
+        fields = [
+            run_ms,
+            event_text,
+            vision_sequence,
+            vision_kind,
+            x_q4,
+            x_px,
+            y_px,
+            velocity_x,
+            confidence,
+            self._field(status, "msp_ms"),
+            self._field(status, "sequence"),
+            self._field(status, "run_id"),
+            self._field(status, "state"),
+            self._field(status, "phase"),
+            self._field(status, "error_q4"),
+            self._field(status, "filtered_velocity"),
+            self._field(status, "current_steps"),
+            self._field(status, "target_steps"),
+            self._field(status, "step_hz"),
+            self._field(status, "dir"),
+            self._field(status, "en"),
+            self._field(status, "step_running"),
+            self._field(status, "vision_fresh"),
+            self._field(status, "settled"),
+            self._field(status, "must_correct"),
+            self._field(status, "approaching"),
+            self._field(status, "recovery_phase"),
+            self._field(status, "tilt_limit"),
+            self._field(status, "crc_errors"),
+            self._field(status, "sequence_drops"),
+            self._field(status, "rx_overflows"),
+            self._field(status, "tx_drops"),
+            status_crc_errors,
+            status_format_errors,
+            status_sequence_drops,
+            status_resets
+        ]
+        return ",".join([str(value) for value in fields]) + "\n"
+
+    @staticmethod
+    def _ensure_directory():
+        try:
+            os.stat(BALL_LOG_DIRECTORY)
+        except Exception:
+            os.mkdir(BALL_LOG_DIRECTORY)
+
+    @classmethod
+    def _next_path(cls):
+        cls._ensure_directory()
+        maximum = 0
+        for name in os.listdir(BALL_LOG_DIRECTORY):
+            if not (
+                name.startswith("run_")
+                and name.endswith(".csv")
+            ):
+                continue
+            try:
+                number = int(name[4:-4])
+                if number > maximum:
+                    maximum = number
+            except Exception:
+                pass
+        return "%s/run_%04d.csv" % (
+            BALL_LOG_DIRECTORY,
+            maximum + 1
+        )
+
+    def _metadata(self):
+        return (
+            "# script_version=%s\n"
+            "# protocol_version=%d\n"
+            "# center_q4=%d\n"
+            "# millimeters_per_pixel=%.6f\n"
+            "# settle_error_q4=%d\n"
+            "# must_correct_q4=%d\n"
+            "# stable_real_frames=%d\n"
+            "# arm_real_frames=%d\n"
+            "# no_progress_real_frames=3\n"
+            "# forced_nudge_steps=4\n"
+            "# far_zone_q4_gt=480 initial_tilt_steps=48\n"
+            "# fine_zone_q4_le=480 fine_tilt_steps=24\n"
+            "# crossing_brake_steps=8 crossing_hz=160\n"
+            "# leveling_target=button_reference leveling_hz=220\n"
+            "# fine_step_hz=80 bias_decay_steps_per_real_frame=2\n"
+            "# tilt_max_steps=120 increment=12\n"
+            "# forced_action_min_interval_ms=500\n"
+            "# recovery=backoff12_then_reapply interval_ms=500\n"
+            "# vision_hold_ms=150 vision_fault_ms=1000\n"
+            "# log_settled_close_ms=3000 log_max_run_ms=60000\n"
+            % (
+                SCRIPT_VERSION,
+                UART_PROTOCOL_VERSION,
+                BALL_CENTER_Q4,
+                BALL_MM_PER_PIXEL,
+                BALL_CENTER_SETTLE_Q4,
+                BALL_CENTER_MUST_CORRECT_Q4,
+                BALL_CENTER_STABLE_FRAMES,
+                BALL_CENTER_ARM_FRAMES
+            )
+        )
+
+    def _disable_after_write_error(self, error):
+        path = self.path
+        try:
+            if self.file is not None:
+                self.file.close()
+        except Exception:
+            pass
+        self.file = None
+        self.active = False
+        self.buffer = []
+        self.settled_since_ms = None
+        log_event(
+            "ball CSV disabled path=%s error=%s"
+            % (path, error)
+        )
+
+    def _flush(self, force=False):
+        if not self.active or self.file is None:
+            return
+        now_ms = time.ticks_ms()
+        if (
+            not force
+            and len(self.buffer) < BALL_LOG_FLUSH_ROWS
+            and time.ticks_diff(now_ms, self.last_flush_ms)
+                < BALL_LOG_FLUSH_MS
+        ):
+            return
+        if not self.buffer:
+            return
+        try:
+            self.file.write("".join(self.buffer))
+            self.buffer = []
+            try:
+                self.file.flush()
+            except Exception:
+                pass
+            self.last_flush_ms = now_ms
+        except Exception as error:
+            self._disable_after_write_error(error)
+
+    def _start_run(self, status, now_ms):
+        if self.active:
+            self.close("new_center_start")
+        try:
+            self.path = self._next_path()
+            self.file = open(self.path, "w")
+            self.file.write(self._metadata())
+            self.file.write(
+                "# msp_run_id=%d\n"
+                % status.get("run_id", 0)
+            )
+            self.file.write(self.CSV_HEADER)
+            self.active = True
+            self.run_start_ms = now_ms
+            self.run_id = status.get("run_id", 0)
+            self.last_seen_run_id = self.run_id
+            self.last_flush_ms = now_ms
+            self.settled_since_ms = None
+            for sample in self.pretrigger:
+                self.buffer.append(self._format_row(sample))
+            self.pretrigger = []
+            self._flush(force=True)
+            log_event(
+                "ball CSV start path=%s run_id=%d"
+                % (self.path, self.run_id)
+            )
+        except Exception as error:
+            self._disable_after_write_error(error)
+
+    def close(self, reason):
+        if not self.active:
+            return
+        path = self.path
+        self._flush(force=True)
+        if self.file is not None:
+            try:
+                self.file.write("# close_reason=%s\n" % reason)
+                try:
+                    self.file.flush()
+                except Exception:
+                    pass
+                self.file.close()
+            except Exception as error:
+                self._disable_after_write_error(error)
+                return
+        self.file = None
+        self.active = False
+        self.buffer = []
+        self.settled_since_ms = None
+        log_event(
+            "ball CSV closed path=%s reason=%s"
+            % (path, reason)
+        )
+
+    def record(self, motion, uart_link, events):
+        now_ms = time.ticks_ms()
+        event_names = []
+        close_reason = None
+        saw_msp_reset = False
+
+        for status in events:
+            if status.get("msp_reset", 0):
+                event_names.append("MSP_RESET")
+                close_reason = "msp_reset_manual_stop"
+                saw_msp_reset = True
+                continue
+            event = status.get("event", 0)
+            if event:
+                name = self.EVENT_NAMES.get(
+                    event,
+                    "EVENT_%d" % event
+                )
+                event_names.append(name)
+            if event == 1:
+                self._start_run(status, now_ms)
+            elif event == 6:
+                close_reason = "vision_fault"
+            elif event == 8:
+                close_reason = "double_click_override"
+
+        latest_status = uart_link.latest_status
+        if latest_status is not None and not saw_msp_reset:
+            latest_run_id = latest_status.get("run_id", 0)
+            if (
+                latest_run_id != self.last_seen_run_id
+                and latest_status.get("phase") == 1
+            ):
+                event_names.append("CENTER_START_INFERRED")
+                self._start_run(latest_status, now_ms)
+                self.last_seen_run_id = latest_run_id
+
+        event_text = "|".join(event_names)
+        sample = self._snapshot(
+            now_ms,
+            motion,
+            uart_link,
+            event_text
+        )
+
+        if not self.active:
+            self.pretrigger.append(sample)
+            while (
+                self.pretrigger
+                and time.ticks_diff(
+                    now_ms,
+                    self.pretrigger[0][0]
+                ) > BALL_LOG_PRETRIGGER_MS
+            ):
+                del self.pretrigger[0]
+            return
+
+        self.buffer.append(self._format_row(sample))
+        status = latest_status
+        if status is not None:
+            if (
+                close_reason is None
+                and status.get("state") in (4, 5)
+            ):
+                close_reason = "control_fault"
+            if (
+                close_reason is None
+                and status.get("settled", 0)
+                and abs(status.get("error_q4", 32767))
+                    < BALL_CENTER_MUST_CORRECT_Q4
+                and status.get("vision_fresh", 0)
+                and time.ticks_diff(
+                    now_ms,
+                    status.get("received_ms", 0)
+                ) < 200
+            ):
+                if self.settled_since_ms is None:
+                    self.settled_since_ms = now_ms
+                elif time.ticks_diff(
+                    now_ms,
+                    self.settled_since_ms
+                ) >= BALL_LOG_SETTLED_CLOSE_MS:
+                    close_reason = "settled_3s"
+            else:
+                self.settled_since_ms = None
+
+        if (
+            close_reason is None
+            and time.ticks_diff(
+                now_ms,
+                self.run_start_ms
+            ) >= BALL_LOG_MAX_RUN_MS
+        ):
+            close_reason = "run_limit_60s"
+
+        self._flush()
+        if close_reason is not None:
+            self.close(close_reason)
 
 
 class BallServoController:
@@ -1829,9 +2411,10 @@ def draw_marker(pipeline, motion, uart_sender=None):
     if uart_sender is None or uart_sender.uart is None:
         uart_text = "UART:OFF"
     else:
-        uart_text = "TX:%d E:%d" % (
+        uart_text = "TX:%d RX:%d C:%d" % (
             uart_sender.sent,
-            uart_sender.failures
+            uart_sender.status_frames,
+            uart_sender.status_crc_errors
         )
     pipeline.osd_img.draw_string_advanced(
         8,
@@ -1936,6 +2519,7 @@ def main():
     tracker = None
     udp = None
     uart_sender = None
+    run_logger = None
     servo = None
     restart_count = 0
 
@@ -1960,6 +2544,7 @@ def main():
         ap, ap_ip = start_ap()
         udp = UdpBallSender(ap_ip)
         uart_sender = BallUartSender()
+        run_logger = BallRunLogger()
         servo = BallServoController()
         log_event(
             "AP已就绪，立即启动LCD、识别、UART与RTSP；"
@@ -2045,6 +2630,12 @@ def main():
                     input_np = pipeline.get_frame()
                     motion = tracker.run(input_np)
                     uart_sender.send(motion)
+                    status_events = uart_sender.poll_status()
+                    run_logger.record(
+                        motion,
+                        uart_sender,
+                        status_events
+                    )
                     draw_marker(
                         pipeline,
                         motion,
@@ -2118,6 +2709,8 @@ def main():
                 raise
 
             except BaseException as error:
+                if run_logger is not None:
+                    run_logger.close("vision_or_media_fault")
                 try:
                     log_event(
                         "识别或媒体链路失败 "
@@ -2229,6 +2822,9 @@ def main():
         if udp is not None:
             udp.close()
 
+        if run_logger is not None:
+            run_logger.close("script_exit")
+
         if uart_sender is not None:
             uart_sender.close()
 
@@ -2236,6 +2832,7 @@ def main():
         pipeline = None
         servo = None
         udp = None
+        run_logger = None
         uart_sender = None
         ap = None
         gc.collect()
