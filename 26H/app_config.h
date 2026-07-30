@@ -1,0 +1,76 @@
+#ifndef APP_CONFIG_H_
+#define APP_CONFIG_H_
+
+/*
+ * 26H requirement 2 tuning constants.
+ *
+ * Encoder targets are counts measured over each 20 ms PI update.  The four
+ * track constants below are the intended on-car tuning surface; the state
+ * machine and its safety gates do not need to change during normal tuning.
+ */
+#define APP_CONTROL_TICK_MS                    (5U)
+#define APP_MOTOR_UPDATE_MS                    (20U)
+#define APP_OLED_UPDATE_MS                     (100U)
+
+#define APP_BUTTON_ACTIVE_LEVEL                (1U)
+#define APP_BUTTON_DEBOUNCE_MS                 (30U)
+
+/*
+ * Grayscale position PID, executed every 5 ms.  Gains are expressed directly
+ * in PWM ticks per error unit/tick so the controller remains integer-only.
+ * The I term is deliberately small and active only near the line center.
+ */
+#define APP_TRACK_BASE_PWM                      (3000U)
+#define APP_TRACK_FINAL_PWM                     (1800U)
+#define APP_TRACK_CENTER_DEADBAND                (60)
+#define APP_TRACK_ERROR_FILTER_DIVISOR           (4)
+#define APP_TRACK_PWM_SLEW_PER_TICK              (200)
+#define APP_LINE_PID_KP                          (5)
+#define APP_LINE_PID_KI_NUMERATOR                (1)
+#define APP_LINE_PID_KI_DIVISOR                  (64)
+#define APP_LINE_PID_KD                          (10)
+#define APP_LINE_PID_D_FILTER_DIVISOR            (4)
+#define APP_LINE_PID_INTEGRAL_ACTIVE_ERROR       (150)
+#define APP_LINE_PID_INTEGRAL_LIMIT              (12800)
+#define APP_LINE_PID_OUTPUT_LIMIT                (3000)
+
+/* Retained for the optional encoder-speed PI interface. */
+#define APP_MOTOR_TARGET_MAX_COUNTS            (68U)
+
+#define APP_LINE_LOST_TIMEOUT_MS               (100U)
+#define APP_ENCODER_STALL_TIMEOUT_MS           (300U)
+#define APP_RUN_TIMEOUT_MS                     (20000U)
+
+#define APP_START_MARKER_CLEAR_MS              (50U)
+#define APP_START_MARKER_CLEAR_COUNTS          (300U)
+#define APP_FINISH_ARM_COUNTS                  (38000U)
+#define APP_FINISH_ARM_MS                      (10000U)
+#define APP_FINAL_APPROACH_COUNTS              (45500U)
+#define APP_MARKER_MIN_CONTIGUOUS_CHANNELS     (4U)
+#define APP_MARKER_CONFIRM_SCANS               (2U)
+
+#define APP_LINE_CHANNEL_COUNT                 (8U)
+#define APP_LINE_MUX_SETTLE_US                 (100U)
+#define APP_LINE_BLACK_LEVEL                   (1U)
+#define APP_LINE_REVERSE_ORDER                 (0U)
+
+/* PI output uses a logical 1600-tick domain and is scaled to TIMG6/8000. */
+#define APP_PWM_PERIOD_TICKS                   (1600U)
+#define APP_PWM_FEEDFORWARD_MIN_TICKS          (160U)
+#define APP_PWM_FEEDFORWARD_TICKS_PER_COUNT    (8U)
+#define APP_PWM_MAX_TICKS                      (1440U)
+#define APP_PI_KP_TICKS_PER_COUNT              (8)
+#define APP_PI_KI_TICKS_PER_COUNT_STEP         (1)
+#define APP_PI_INTEGRAL_MIN_TICKS              (-320)
+#define APP_PI_INTEGRAL_MAX_TICKS              (640)
+
+/* Motor A is the right wheel; Motor B is the left wheel. */
+/* Forward polarity is confirmed on the installed C07A + S28A chassis. */
+#define APP_MOTOR_A_FORWARD_D1                 (0U)
+#define APP_MOTOR_A_FORWARD_D2                 (1U)
+#define APP_MOTOR_B_FORWARD_D1                 (0U)
+#define APP_MOTOR_B_FORWARD_D2                 (1U)
+
+#define APP_FAULT_LED_TOGGLE_MS                (100U)
+
+#endif
