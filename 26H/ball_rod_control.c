@@ -5,6 +5,8 @@
 
 #include <limits.h>
 
+#define BALL_VISION_FLAG_PREDICTED  (0x02U)
+
 static volatile int32_t gCurrentSteps;
 static volatile int32_t gTargetSteps;
 static volatile bool gStepRunning;
@@ -26,6 +28,11 @@ static uint32_t gMotionStartMs;
 static bool gMotionTimerStarted;
 static bool gSequenceTimedOut;
 static uint32_t gReturnToLevelStartMs;
+static int32_t gCenterFilteredVelocity;
+static int32_t gCenterIntegralAccumulator;
+static uint8_t gCenterStableFrames;
+static uint8_t gCenterStuckFrames;
+static bool gCenterSettled;
 
 static bool gButtonRaw;
 static bool gButtonStable;
@@ -75,6 +82,15 @@ static void reset_position_pid(uint32_t nowMs)
     gPositionPidLastError = 0;
     gPositionPidFilteredDerivative = 0;
     gPositionPidLastMs = nowMs;
+}
+
+static void reset_center_hold_state(void)
+{
+    gCenterFilteredVelocity = 0;
+    gCenterIntegralAccumulator = 0;
+    gCenterStableFrames = 0U;
+    gCenterStuckFrames = 0U;
+    gCenterSettled = false;
 }
 
 static void stop_and_hold_current_position(void)
@@ -192,6 +208,7 @@ static void select_center_mode(uint32_t nowMs)
 {
     stop_and_hold_current_position();
     reset_position_pid(nowMs);
+    reset_center_hold_state();
     gMotionPhase = BALL_MOTION_HOLD_CENTER;
     gMotionTimerStarted = false;
     gSequenceTimedOut = false;
@@ -202,6 +219,7 @@ static void start_motion_sequence(uint32_t nowMs)
 {
     stop_and_hold_current_position();
     reset_position_pid(nowMs);
+    reset_center_hold_state();
     gMotionPhase = BALL_MOTION_CENTER_BEFORE_SEQUENCE;
     gMotionTimerStarted = false;
     gSequenceTimedOut = false;
@@ -248,6 +266,217 @@ static void service_operation_button(uint32_t nowMs, bool pressed)
     }
 }
 
+static void update_center_hold_target(const BallVisionSample *vision)
+{
+    int32_t x = (int32_t) ((vision->xQ4 + 8U) >> 4U);
+    int32_t error = APP_BALL_IMAGE_CENTER_X - x;
+    int32_t desiredTarget;
+    int32_t targetChange;
+    uint32_t errorMagnitude = absolute_i32(error);
+    uint32_t velocityMagnitude;
+    bool predicted =
+        (vision->flags & BALL_VISION_FLAG_PREDICTED) != 0U;
+    bool insideCenterBand;
+    bool speedSettled;
+    bool rodAtTarget;
+    bool holdingSettled;
+
+    gCenterFilteredVelocity +=
+        ((int32_t) vision->velocityX - gCenterFilteredVelocity) /
+        APP_BALL_CENTER_VELOCITY_FILTER_DIVISOR;
+    velocityMagnitude = absolute_i32(gCenterFilteredVelocity);
+    insideCenterBand =
+        errorMagnitude <= APP_BALL_CENTER_DEADBAND_PX;
+    speedSettled =
+        velocityMagnitude <= APP_BALL_CENTER_SETTLE_SPEED_PX_S;
+    rodAtTarget =
+        absolute_i32(gTargetSteps - gCurrentSteps) <=
+        APP_BALL_POSITION_TOLERANCE_STEPS;
+    holdingSettled = gCenterSettled &&
+        (errorMagnitude <= APP_BALL_CENTER_RELEASE_PX) &&
+        (velocityMagnitude <= APP_BALL_CENTER_RELEASE_SPEED_PX_S);
+
+    if (insideCenterBand) {
+        gCenterIntegralAccumulator = 0;
+        gCenterStuckFrames = 0U;
+    }
+
+    /*
+     * Once settled, keep the rod level through small detector jitter.  A
+     * genuine position or velocity disturbance leaves this wider hysteresis
+     * band and re-enables the same closed-loop correction without another
+     * button press.
+     */
+    if (holdingSettled) {
+        desiredTarget = 0;
+        gCommandFrequencyHz = APP_BALL_SPEED_NEAR_HZ;
+    } else {
+        int32_t proportional;
+        int32_t damping;
+        int32_t baseTarget;
+
+        if (gCenterSettled) {
+            gCenterSettled = false;
+            gCenterStableFrames = 0U;
+        }
+
+        if (insideCenterBand && speedSettled) {
+            /*
+             * Reaching x=160 is not sufficient: remove the residual rod
+             * angle while the ball is slow, then require the physical step
+             * position to reach level before declaring it settled.
+             */
+            desiredTarget = 0;
+            gCommandFrequencyHz = APP_BALL_SPEED_NEAR_HZ;
+        } else {
+            if (errorMagnitude <= APP_BALL_SPEED_NEAR_ERROR_PX) {
+                gCommandFrequencyHz = APP_BALL_SPEED_NEAR_HZ;
+            } else if (errorMagnitude <=
+                APP_BALL_SPEED_MEDIUM_ERROR_PX) {
+                gCommandFrequencyHz = APP_BALL_SPEED_MEDIUM_HZ;
+            } else {
+                gCommandFrequencyHz = APP_BALL_SPEED_FAR_HZ;
+            }
+
+            /*
+             * A real frame can prove that the ball is stationary and that
+             * the motor has reached the previous request.  Predicted frames
+             * keep the short-term PD output alive, but never confirm a stuck
+             * ball and never modify the retry integral.
+             */
+            if (!predicted) {
+                if (speedSettled && rodAtTarget) {
+                    if (gCenterStuckFrames <
+                        APP_BALL_CENTER_STUCK_REAL_FRAMES) {
+                        gCenterStuckFrames++;
+                    }
+                } else {
+                    gCenterStuckFrames = 0U;
+                    if (!speedSettled) {
+                        int32_t decay =
+                            gCenterIntegralAccumulator /
+                            APP_BALL_CENTER_INTEGRAL_DECAY_DIVISOR;
+
+                        if (decay == 0) {
+                            gCenterIntegralAccumulator = 0;
+                        } else {
+                            gCenterIntegralAccumulator -= decay;
+                        }
+                    }
+                }
+            }
+
+            proportional =
+                (error * APP_BALL_POSITION_KP_NUMERATOR) /
+                APP_BALL_POSITION_KP_DIVISOR;
+            damping =
+                (-gCenterFilteredVelocity *
+                    APP_BALL_POSITION_KD_NUMERATOR) /
+                APP_BALL_POSITION_KD_DIVISOR;
+            baseTarget = proportional + damping;
+
+            if (!predicted && speedSettled && rodAtTarget &&
+                (gCenterStuckFrames >=
+                    APP_BALL_CENTER_STUCK_REAL_FRAMES)) {
+                int32_t candidateAccumulator = clamp_i32(
+                    gCenterIntegralAccumulator + error,
+                    -APP_BALL_CENTER_INTEGRAL_LIMIT,
+                    APP_BALL_CENTER_INTEGRAL_LIMIT);
+
+                /*
+                 * Clamp the accumulator against the remaining part of the
+                 * +/-60-step control-angle budget.  This lets the retry term
+                 * reach saturation once, but never wind farther toward the
+                 * much wider +/-238-step software travel boundary.
+                 */
+                if (error > 0) {
+                    int32_t maximumAccumulator =
+                        (APP_BALL_ANGLE_TARGET_LIMIT_STEPS - baseTarget) *
+                        APP_BALL_CENTER_INTEGRAL_DIVISOR;
+
+                    if (gCenterIntegralAccumulator <
+                        maximumAccumulator) {
+                        if (candidateAccumulator >
+                            maximumAccumulator) {
+                            candidateAccumulator = maximumAccumulator;
+                        }
+                        gCenterIntegralAccumulator =
+                            candidateAccumulator;
+                    }
+                } else {
+                    int32_t minimumAccumulator =
+                        (-APP_BALL_ANGLE_TARGET_LIMIT_STEPS - baseTarget) *
+                        APP_BALL_CENTER_INTEGRAL_DIVISOR;
+
+                    if (gCenterIntegralAccumulator >
+                        minimumAccumulator) {
+                        if (candidateAccumulator <
+                            minimumAccumulator) {
+                            candidateAccumulator = minimumAccumulator;
+                        }
+                        gCenterIntegralAccumulator =
+                            candidateAccumulator;
+                    }
+                }
+            }
+
+            desiredTarget = baseTarget +
+                (gCenterIntegralAccumulator /
+                    APP_BALL_CENTER_INTEGRAL_DIVISOR);
+
+            /*
+             * Near center the damping term can intentionally reverse the
+             * requested tilt to brake the ball.  Preserve the sign of the
+             * final PD command rather than forcing the position-error sign.
+             */
+            if ((desiredTarget != 0) &&
+                (absolute_i32(desiredTarget) <
+                    APP_BALL_MIN_EFFECTIVE_TILT_STEPS)) {
+                desiredTarget = (desiredTarget > 0) ?
+                    APP_BALL_MIN_EFFECTIVE_TILT_STEPS :
+                    -APP_BALL_MIN_EFFECTIVE_TILT_STEPS;
+            }
+        }
+    }
+
+    desiredTarget = clamp_i32(desiredTarget,
+        -APP_BALL_ANGLE_TARGET_LIMIT_STEPS,
+        APP_BALL_ANGLE_TARGET_LIMIT_STEPS);
+    desiredTarget = clamp_i32(desiredTarget,
+        APP_BALL_MIN_STEPS, APP_BALL_MAX_STEPS);
+    targetChange = clamp_i32(desiredTarget - gTargetSteps,
+        -APP_BALL_TARGET_SLEW_STEPS_PER_FRAME,
+        APP_BALL_TARGET_SLEW_STEPS_PER_FRAME);
+    gTargetSteps = clamp_i32(gTargetSteps + targetChange,
+        APP_BALL_MIN_STEPS, APP_BALL_MAX_STEPS);
+
+    /*
+     * Predicted K230 frames remain useful for one-frame control continuity,
+     * but only real detections can advance the stable confirmation count.
+     */
+    if (!predicted) {
+        if (insideCenterBand && speedSettled &&
+            (absolute_i32(gTargetSteps) <=
+                APP_BALL_POSITION_TOLERANCE_STEPS) &&
+            (absolute_i32(gCurrentSteps) <=
+                APP_BALL_POSITION_TOLERANCE_STEPS)) {
+            if (gCenterStableFrames <
+                APP_BALL_CENTER_STABLE_REAL_FRAMES) {
+                gCenterStableFrames++;
+            }
+            if (gCenterStableFrames >=
+                APP_BALL_CENTER_STABLE_REAL_FRAMES) {
+                gCenterSettled = true;
+            }
+        } else {
+            gCenterStableFrames = 0U;
+        }
+    }
+
+    gTelemetry.ballX = (int16_t) x;
+    gTelemetry.ballError = (int16_t) error;
+}
+
 static void service_return_to_level(uint32_t nowMs)
 {
     if (gMotionPhase != BALL_MOTION_RETURN_TO_LEVEL) {
@@ -283,8 +512,8 @@ static void service_return_to_level(uint32_t nowMs)
 static void update_pid_target(const BallVisionSample *vision)
 {
     int32_t x = (int32_t) ((vision->xQ4 + 8U) >> 4U);
-    bool centerMode = (gMotionPhase == BALL_MOTION_HOLD_CENTER) ||
-        (gMotionPhase == BALL_MOTION_CENTER_BEFORE_SEQUENCE);
+    bool centerMode =
+        gMotionPhase == BALL_MOTION_CENTER_BEFORE_SEQUENCE;
     int32_t imageTarget = centerMode ? APP_BALL_IMAGE_CENTER_X :
         ((gMotionPhase == BALL_MOTION_TO_POSITIVE_5CM) ?
             APP_BALL_POSITIVE_5CM_X : APP_BALL_NEGATIVE_5CM_X);
@@ -458,6 +687,7 @@ void ball_rod_init(uint32_t nowMs)
     gPositionPidLastError = 0;
     gPositionPidFilteredDerivative = 0;
     gPositionPidLastMs = nowMs;
+    reset_center_hold_state();
     gButtonRaw = false;
     gButtonStable = false;
     gButtonEmergencyHandled = false;
@@ -520,7 +750,11 @@ void ball_rod_tick_5ms(
             (gMotionPhase != BALL_MOTION_IDLE) &&
             (gMotionPhase != BALL_MOTION_RETURN_TO_LEVEL) &&
             (gTelemetry.state != BALL_ROD_SAFETY_FAULT)) {
-            update_pid_target(vision);
+            if (gMotionPhase == BALL_MOTION_HOLD_CENTER) {
+                update_center_hold_target(vision);
+            } else {
+                update_pid_target(vision);
+            }
         }
     }
 
@@ -548,11 +782,13 @@ void ball_rod_tick_5ms(
             APP_BALL_VISION_FAULT_MS)) {
         gTargetSteps = 0;
         gPositionPidInitialized = false;
+        reset_center_hold_state();
         gTelemetry.state = BALL_ROD_VISION_FAULT;
     } else if (elapsed_ms(nowMs, vision->lastValidMs,
                    APP_BALL_VISION_RETURN_MS)) {
         gTargetSteps = 0;
         gPositionPidInitialized = false;
+        reset_center_hold_state();
         gTelemetry.state = BALL_ROD_RETURNING;
     } else {
         gTelemetry.state = BALL_ROD_ACTIVE;
