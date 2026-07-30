@@ -19,8 +19,8 @@ Use the narrowest source that is authoritative for the fact being decided. A hig
 - S28A schematic: [`board-docs/s28a/4.C07A适配S28A底板原理图.pdf`](board-docs/s28a/4.C07A适配S28A底板原理图.pdf).
 - S28A resource map: [`board-docs/s28a/3.C07A搭配S28A底板资源分配表25.7.29.pdf`](board-docs/s28a/3.C07A搭配S28A底板资源分配表25.7.29.pdf).
 - Complete board-document inventory: [`board-docs/index.md`](board-docs/index.md).
-- Hiwonder LDX-227 V1.0 manufacturer datasheet and evidence boundaries: [`module-docs/ldx-227/index.md`](module-docs/ldx-227/index.md).
-- Hiwonder LD-3015MG V1.0 manufacturer datasheet at repository root, the installed PAN/TILT model assignment, and cross-model bring-up boundaries: [`module-docs/gimbal-servos.md`](module-docs/gimbal-servos.md).
+- Official competition statement: [`competition/H题_车载平衡滚球运动控制系统.pdf`](competition/H题_车载平衡滚球运动控制系统.pdf), including the 25 cm PPR beam, camera-only ball-position sensing, vehicle envelope, and test requirements.
+- D36A user manual, troubleshooting guide, schematic, ATD5984/RT8279 datasheets, current-setting workbook, and supplied 42-stepper linkage documents: [`module-docs/d36a-ballrod/index.md`](module-docs/d36a-ballrod/index.md).
 - Eight-channel grayscale user manual and two vendor/example documents, including fixed project binding and example-code boundaries: [`module-docs/grayscale/index.md`](module-docs/grayscale/index.md).
 - K230 Kendryte datasheet snapshot, Hiwonder development-board V1.0 schematic, and 74 CanMV/MicroPython reference examples: [`module-docs/k230/index.md`](module-docs/k230/index.md).
 - Known-tested K230 runtime evidence from a prior integrated build: `CanMV v1.4-19-ga7de1c8` on `k230_canmv_hiwonder`; runtime introspection confirmed that build's UART1 TX/RX FPIOA tokens and UART instance. Re-probe the active device after any firmware change.
@@ -35,9 +35,10 @@ Method-only reference: [`mc3545dada/mspm0-skill`](https://github.com/mc3545dada/
 - Current MSPM0G350x silicon errata.
 - The actual CCS/SysConfig project, installed MSPM0 SDK, SDK API docs/examples, and exact CCS/SysConfig/compiler versions.
 - Matching CanMV API documentation for the known-tested build, the active device's currently installed firmware/build, exact touch-panel variant, and the model/utility assets referenced under `/sdcard` by many examples.
-- Confirmed redistribution license for the supplied K230 PDFs and example bundle; no license file accompanied them.
+- Confirmed redistribution license for the supplied K230 and D36A/ball-rod document bundles; no license file accompanied them.
 - Exact installed grayscale illumination variant, calibrated black/white active polarity, and verified address-settling time. Bundled examples disagree on the delay, so none is a final project value.
-- Selected servo-rail regulator/BEC or direct-battery design documentation; the final supply topology is intentionally undecided.
+- Exact 42-stepper model, rated phase current, winding colors, phase resistance, direction polarity, mechanical zero, safe travel, and loaded thermal/lost-step behavior.
+- Loaded D36A behavior across the user-selected 7.4 V direct-feed battery range. The vendor module manual uses 12 V; chip-level 5.5 V limits do not prove complete-module performance.
 - Motor/encoder datasheet and measured polarity, reduction ratio, PPR, wheel diameter, and track width.
 - OLED controller/protocol documentation if its existing driver cannot establish the four signal roles.
 

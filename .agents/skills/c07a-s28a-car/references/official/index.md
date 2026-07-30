@@ -6,4 +6,4 @@
 
 The current repository does not yet include the MSPM0 G-Series 80MHz Technical Reference Manual or MSPM0G350x silicon errata. Add only authentic TI documents; do not synthesize missing PDF content.
 
-Use the separate [board-document index](../board-docs/index.md) for C07A and S28A material. Use the [K230](../module-docs/k230/index.md), [LDX-227](../module-docs/ldx-227/index.md), and [eight-channel grayscale](../module-docs/grayscale/index.md) indexes for bundled external-module documents. Refer to [source-priority.md](../source-priority.md) for authority boundaries.
+Use the separate [board-document index](../board-docs/index.md) for C07A and S28A material. Use the [K230](../module-docs/k230/index.md), [D36A and ball-rod](../module-docs/d36a-ballrod/index.md), and [eight-channel grayscale](../module-docs/grayscale/index.md) indexes for bundled external-module documents. Refer to [source-priority.md](../source-priority.md) for authority boundaries.

@@ -92,12 +92,14 @@ When creating a new instance and the active project has no conflicting naming co
 UART_K230
 I2C_IMU
 PWM_MOTOR
-PWM_GIMBAL
+STEP_BALL_ROD
 GPIO_LINE_ADDR
 GPIO_LINE_OUT
 GPIO_MOTOR_DIR
 GPIO_ENCODER_A
 GPIO_ENCODER_B
+GPIO_BALL_ROD_DIR
+GPIO_D36A_EN
 GPIO_STATUS
 ```
 

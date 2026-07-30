@@ -1,0 +1,5 @@
+# Bundled hardware-reference artifacts are opaque binary files.
+.agents/skills/c07a-s28a-car/references/competition/*.pdf binary
+.agents/skills/c07a-s28a-car/references/module-docs/d36a-ballrod/*.pdf binary
+.agents/skills/c07a-s28a-car/references/module-docs/d36a-ballrod/*.xlsx binary
+.agents/skills/c07a-s28a-car/references/module-docs/d36a-ballrod/*.png binary

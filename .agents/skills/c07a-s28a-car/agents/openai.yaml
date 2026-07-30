@@ -1,4 +1,4 @@
 interface:
-  display_name: "C07A + S28A 电赛小车"
-  short_description: "C07A/S28A 小车的 MSPM0 与 K230 硬件事实及防幻觉工作流"
-  default_prompt: "使用 $c07a-s28a-car 检查并安全修改当前 C07A + S28A 小车的 MSPM0 SysConfig 或 K230 CanMV 工程。"
+  display_name: "C07A + S28A H 题平衡滚球小车"
+  short_description: "C07A/S28A、K230 与 D36A 球杆系统硬件及固件工作流"
+  default_prompt: "使用 $c07a-s28a-car 检查并安全修改 H 题平衡滚球小车的 MSPM0、K230 或 D36A 球杆系统。"

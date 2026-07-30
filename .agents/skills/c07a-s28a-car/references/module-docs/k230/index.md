@@ -38,13 +38,13 @@ High-value routes for this car project:
 4. The known-tested `CanMV v1.4-19-ga7de1c8` `k230_canmv_hiwonder` runtime confirmed `FPIOA.UART1_TXD`, `FPIOA.UART1_RXD`, and `UART.UART1` for a prior integrated build. Repeat runtime help/introspection on the active device and after firmware replacement before reusing those exact tokens.
 5. Configure or verify 115200 baud, 8 data bits, no parity, and 1 stop bit according to the exact current UART API. Keep TX/RX crossed and verify logic levels before connecting.
 6. Treat `UART.py` as a one-byte LED demonstration, not as the car protocol. Add framing, buffering, validation, timeout/recovery, and bidirectional command/result handling according to `project-architecture.md`.
-7. Keep image thresholds, ROIs, resolution, frame rate, and 30 Hz result publishing separately configurable. Do not make the camera loop block on UART or LCD work.
+7. For the H problem, use the camera to measure ball position over the full useful beam travel. Keep image thresholds, ROIs, resolution, frame rate, and 30 Hz result publishing separately configurable. Do not make the camera loop block on UART or LCD work.
 8. Use `try/finally` cleanup appropriate to the current firmware. Verify `sensor.stop()`, `Display.deinit()`, `MediaManager.deinit()`, UART deinit, and `os.exitpoint()` availability before copying those calls.
 9. Validate in layers: syntax/imports, peripheral initialization, camera/display output, UART loopback, MSPM0 interoperability, then full on-car behavior. A script compiling under desktop Python proves only syntax.
 
 ## Known-tested UART1 receive pattern
 
-When the gimbal tracks but the LCD reports `MSP RX:0`, do not debug the vision CRC first: outbound K230 traffic is already working, while CanMV has received zero raw return bytes. A prior integrated hardware build passed bidirectional status reception only after IO4's input/output/pull/Schmitt attributes were set explicitly and the UART read timeout was set to 2 ms. Preserve that combined known-good pattern and the raw-byte/valid/CRC/format counters when porting the tracker, but revalidate it on the active firmware. Read [K230 UART and gimbal PWM bring-up](../../gimbal-k230-uart-debugging.md) for the exact configuration, evidence boundary, RX-only mode, and oscilloscope decision tree.
+If K230 vision results reach the MSPM0 but the LCD reports `MSP RX:0`, do not debug the vision-result CRC first: outbound K230 traffic is already working, while CanMV has received zero raw return bytes. A prior integrated hardware build passed bidirectional status reception only after IO4's input/output/pull/Schmitt attributes were set explicitly and the UART read timeout was set to 2 ms. Preserve that combined known-good pattern and the raw-byte/valid/CRC/format counters when porting the application, but revalidate it on the active firmware. Read [K230 UART bring-up](../../k230-uart-debugging.md) for the exact configuration, evidence boundary, RX-only mode, and oscilloscope decision tree.
 
 ## Security and dependency boundaries
 
