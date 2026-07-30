@@ -33,8 +33,6 @@
 #include "ti_msp_dl_config.h"
 
 #include "app_config.h"
-#include "ball_protocol.h"
-#include "ball_rod_control.h"
 #include "motor_control.h"
 
 #include <stdbool.h>
@@ -64,7 +62,6 @@
 #define OLED_FIRST_PAGE        (1U)
 #define OLED_RENDER_PAGE_COUNT (5U)
 #define OLED_TOP_PIXEL         (12U)
-#define OLED_HALF_CLOCK_CYCLES (CPUCLK_FREQ / 4000000U)
 
 #define LINE_SETTLE_CYCLES \
     ((CPUCLK_FREQ / 1000000U) * APP_LINE_MUX_SETTLE_US)
@@ -107,7 +104,6 @@ static bool gDisplayDirty = true;
 static uint8_t gButtonRaw;
 static uint8_t gButtonStable;
 static uint32_t gButtonRawChangedMs;
-static uint32_t gBallLedLastToggleMs;
 
 static bool elapsed_ms(uint32_t startMs, uint32_t durationMs)
 {
@@ -193,21 +189,15 @@ static uint32_t abs_delta_i32(int32_t value, int32_t origin)
 
 static void wait_ms(uint32_t durationMs)
 {
-    while (durationMs-- != 0U) {
-        DL_Common_delayCycles(CPUCLK_FREQ / 1000U);
+    uint32_t startMs = gMs;
+
+    while (!elapsed_ms(startMs, durationMs)) {
+        __WFI();
     }
 }
 
 static void oled_write_byte(uint8_t value, bool data)
 {
-    uint32_t primask = __get_PRIMASK();
-
-    /*
-     * STEP/UART interrupts must not split one software-serial byte.  Keep
-     * the critical section byte-sized so the real-time pulse counter is
-     * delayed only a few microseconds.
-     */
-    __disable_irq();
     if (data) {
         DL_GPIO_setPins(DISPLAY_DC_PORT, DISPLAY_DC_PIN);
     } else {
@@ -216,18 +206,13 @@ static void oled_write_byte(uint8_t value, bool data)
 
     for (uint8_t bit = 0U; bit < 8U; bit++) {
         DL_GPIO_clearPins(DISPLAY_SCL_PORT, DISPLAY_SCL_PIN);
-        DL_Common_delayCycles(OLED_HALF_CLOCK_CYCLES);
         if ((value & 0x80U) != 0U) {
             DL_GPIO_setPins(DISPLAY_SDA_PORT, DISPLAY_SDA_PIN);
         } else {
             DL_GPIO_clearPins(DISPLAY_SDA_PORT, DISPLAY_SDA_PIN);
         }
         DL_GPIO_setPins(DISPLAY_SCL_PORT, DISPLAY_SCL_PIN);
-        DL_Common_delayCycles(OLED_HALF_CLOCK_CYCLES);
         value <<= 1U;
-    }
-    if (primask == 0U) {
-        __enable_irq();
     }
 }
 
@@ -251,132 +236,6 @@ static void oled_clear(void)
             oled_write_byte(0U, true);
         }
     }
-}
-
-static const uint8_t *oled_small_glyph(char character)
-{
-    static const uint8_t digits[10][5] = {
-        {0x3EU, 0x51U, 0x49U, 0x45U, 0x3EU},
-        {0x00U, 0x42U, 0x7FU, 0x40U, 0x00U},
-        {0x42U, 0x61U, 0x51U, 0x49U, 0x46U},
-        {0x21U, 0x41U, 0x45U, 0x4BU, 0x31U},
-        {0x18U, 0x14U, 0x12U, 0x7FU, 0x10U},
-        {0x27U, 0x45U, 0x45U, 0x45U, 0x39U},
-        {0x3CU, 0x4AU, 0x49U, 0x49U, 0x30U},
-        {0x01U, 0x71U, 0x09U, 0x05U, 0x03U},
-        {0x36U, 0x49U, 0x49U, 0x49U, 0x36U},
-        {0x06U, 0x49U, 0x49U, 0x29U, 0x1EU},
-    };
-    static const uint8_t letters[26][5] = {
-        {0x7EU, 0x11U, 0x11U, 0x11U, 0x7EU},
-        {0x7FU, 0x49U, 0x49U, 0x49U, 0x36U},
-        {0x3EU, 0x41U, 0x41U, 0x41U, 0x22U},
-        {0x7FU, 0x41U, 0x41U, 0x22U, 0x1CU},
-        {0x7FU, 0x49U, 0x49U, 0x49U, 0x41U},
-        {0x7FU, 0x09U, 0x09U, 0x09U, 0x01U},
-        {0x3EU, 0x41U, 0x49U, 0x49U, 0x7AU},
-        {0x7FU, 0x08U, 0x08U, 0x08U, 0x7FU},
-        {0x00U, 0x41U, 0x7FU, 0x41U, 0x00U},
-        {0x20U, 0x40U, 0x41U, 0x3FU, 0x01U},
-        {0x7FU, 0x08U, 0x14U, 0x22U, 0x41U},
-        {0x7FU, 0x40U, 0x40U, 0x40U, 0x40U},
-        {0x7FU, 0x02U, 0x0CU, 0x02U, 0x7FU},
-        {0x7FU, 0x04U, 0x08U, 0x10U, 0x7FU},
-        {0x3EU, 0x41U, 0x41U, 0x41U, 0x3EU},
-        {0x7FU, 0x09U, 0x09U, 0x09U, 0x06U},
-        {0x3EU, 0x41U, 0x51U, 0x21U, 0x5EU},
-        {0x7FU, 0x09U, 0x19U, 0x29U, 0x46U},
-        {0x46U, 0x49U, 0x49U, 0x49U, 0x31U},
-        {0x01U, 0x01U, 0x7FU, 0x01U, 0x01U},
-        {0x3FU, 0x40U, 0x40U, 0x40U, 0x3FU},
-        {0x1FU, 0x20U, 0x40U, 0x20U, 0x1FU},
-        {0x3FU, 0x40U, 0x38U, 0x40U, 0x3FU},
-        {0x63U, 0x14U, 0x08U, 0x14U, 0x63U},
-        {0x07U, 0x08U, 0x70U, 0x08U, 0x07U},
-        {0x61U, 0x51U, 0x49U, 0x45U, 0x43U},
-    };
-    static const uint8_t blank[5] = {0U, 0U, 0U, 0U, 0U};
-    static const uint8_t colon[5] = {0U, 0x36U, 0x36U, 0U, 0U};
-    static const uint8_t plus[5] = {0x08U, 0x08U, 0x3EU, 0x08U, 0x08U};
-    static const uint8_t minus[5] = {0x08U, 0x08U, 0x08U, 0x08U, 0x08U};
-
-    if ((character >= '0') && (character <= '9')) {
-        return digits[(uint8_t) (character - '0')];
-    }
-    if ((character >= 'A') && (character <= 'Z')) {
-        return letters[(uint8_t) (character - 'A')];
-    }
-    if (character == ':') {
-        return colon;
-    }
-    if (character == '+') {
-        return plus;
-    }
-    if (character == '-') {
-        return minus;
-    }
-    return blank;
-}
-
-static void __attribute__((unused)) oled_write_small_line(
-    uint8_t page, const char *text)
-{
-    uint8_t column = 0U;
-
-    oled_set_position(0U, page);
-    while ((*text != '\0') && (column <= (OLED_WIDTH_PIXELS - 6U))) {
-        const uint8_t *glyph = oled_small_glyph(*text++);
-
-        for (uint8_t index = 0U; index < 5U; index++) {
-            oled_write_byte(glyph[index], true);
-        }
-        oled_write_byte(0U, true);
-        column += 6U;
-    }
-    while (column++ < OLED_WIDTH_PIXELS) {
-        oled_write_byte(0U, true);
-    }
-}
-
-static char *__attribute__((unused)) append_text(
-    char *destination, const char *source)
-{
-    while (*source != '\0') {
-        *destination++ = *source++;
-    }
-    *destination = '\0';
-    return destination;
-}
-
-static char *append_u32(char *destination, uint32_t value)
-{
-    char reverse[10];
-    uint8_t count = 0U;
-
-    do {
-        reverse[count++] = (char) ('0' + (value % 10U));
-        value /= 10U;
-    } while ((value != 0U) && (count < sizeof(reverse)));
-    while (count != 0U) {
-        *destination++ = reverse[--count];
-    }
-    *destination = '\0';
-    return destination;
-}
-
-static char *__attribute__((unused)) append_i32(
-    char *destination, int32_t value)
-{
-    uint32_t magnitude;
-
-    if (value < 0) {
-        *destination++ = '-';
-        magnitude = (uint32_t) (-value);
-    } else {
-        *destination++ = '+';
-        magnitude = (uint32_t) value;
-    }
-    return append_u32(destination, magnitude);
 }
 
 static void oled_init(void)
@@ -535,7 +394,7 @@ static void format_elapsed_time(uint32_t elapsedMs, char text[6])
     text[index] = '\0';
 }
 
-static void __attribute__((unused)) oled_service(void)
+static void oled_service(void)
 {
     char text[6];
     uint32_t shownMs;
@@ -565,68 +424,6 @@ static void __attribute__((unused)) oled_service(void)
     oled_write_text(text);
 }
 
-static void ball_oled_service(void)
-{
-    BallRodTelemetry telemetry;
-    char text[6];
-
-    if (!elapsed_ms(gLastOledUpdateMs, APP_OLED_UPDATE_MS)) {
-        return;
-    }
-    gLastOledUpdateMs = gMs;
-    telemetry = ball_rod_get_telemetry();
-
-    /*
-     * Reuse the original large-font renderer that is verified on the S28A
-     * OLED.  The previous four-line small-font path produced a blank panel
-     * on the installed display.
-     */
-    if ((telemetry.state == BALL_ROD_VISION_FAULT) ||
-        (telemetry.state == BALL_ROD_SAFETY_FAULT)) {
-        oled_write_text("Err");
-        return;
-    }
-    if (telemetry.state == BALL_ROD_ACTIVE) {
-        append_u32(text, (uint16_t) telemetry.ballX);
-        oled_write_text(text);
-        return;
-    }
-    oled_write_text("0.0s");
-}
-
-static void ball_led_service(BallRodState state)
-{
-    uint32_t toggleMs;
-
-    if (state == BALL_ROD_ACTIVE) {
-        DL_GPIO_setPins(LED_PORT, LED_led_PIN);
-        return;
-    }
-    toggleMs = ((state == BALL_ROD_VISION_FAULT) ||
-        (state == BALL_ROD_SAFETY_FAULT)) ?
-        APP_BALL_LED_FAULT_TOGGLE_MS : APP_BALL_LED_WAIT_TOGGLE_MS;
-    if (elapsed_ms(gBallLedLastToggleMs, toggleMs)) {
-        gBallLedLastToggleMs = gMs;
-        DL_GPIO_togglePins(LED_PORT, LED_led_PIN);
-    }
-}
-
-static void __attribute__((unused)) ball_static_tick_5ms(void)
-{
-    BallVisionSample vision;
-    BallRodTelemetry telemetry;
-    bool buttonPressed =
-        ((DL_GPIO_readPins(KEY_PORT, KEY_key_PIN) & KEY_key_PIN) != 0U) ==
-        (APP_BUTTON_ACTIVE_LEVEL != 0U);
-
-    ball_protocol_process_5ms(gMs);
-    vision = ball_protocol_get_sample();
-    ball_rod_tick_5ms(gMs, buttonPressed, &vision);
-    telemetry = ball_rod_get_telemetry();
-    ball_led_service(telemetry.state);
-    ball_oled_service();
-}
-
 static void line_sensor_select(uint8_t channel)
 {
     if ((channel & 0x01U) != 0U) {
@@ -646,7 +443,7 @@ static void line_sensor_select(uint8_t channel)
     }
 }
 
-static void __attribute__((unused)) line_sensor_init(void)
+static void line_sensor_init(void)
 {
     line_sensor_select(0U);
     DL_Common_delayCycles(LINE_SETTLE_CYCLES);
@@ -894,7 +691,7 @@ static void update_line_control(uint8_t lineMask)
     }
 }
 
-static void __attribute__((unused)) drive_tick_5ms(void)
+static void drive_tick_5ms(void)
 {
     uint8_t lineMask;
     uint32_t distance;
@@ -956,42 +753,6 @@ static bool take_control_tick(void)
 int main(void)
 {
     SYSCFG_DL_init();
-#if APP_OPERATION_MODE == APP_OPERATION_MODE_BALL_STATIC
-    motor_control_init();
-    motor_control_brake();
-    DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
-    ball_protocol_init();
-    ball_rod_init(0U);
-
-    /*
-     * Complete the OLED reset and command sequence before any UART, STEP or
-     * control interrupt can split it.  wait_ms() is CPU-clock based, so this
-     * no longer depends on TIMER_0 already running.
-     */
-    oled_init();
-    oled_write_text("0.0s");
-
-    NVIC_ClearPendingIRQ(PWM_BALL_STEP_INST_INT_IRQN);
-    NVIC_ClearPendingIRQ(UART_K230_INST_INT_IRQN);
-    NVIC_ClearPendingIRQ(TIMER_0_INST_INT_IRQN);
-    NVIC_EnableIRQ(PWM_BALL_STEP_INST_INT_IRQN);
-    NVIC_EnableIRQ(UART_K230_INST_INT_IRQN);
-    NVIC_EnableIRQ(TIMER_0_INST_INT_IRQN);
-    DL_TimerG_startCounter(TIMER_0_INST);
-
-    __disable_irq();
-    gControlTicksPending = 0U;
-    __enable_irq();
-    gLastOledUpdateMs = (uint32_t) (0U - APP_OLED_UPDATE_MS);
-
-    while (1) {
-        if (take_control_tick()) {
-            ball_static_tick_5ms();
-        } else {
-            __WFI();
-        }
-    }
-#else
     line_sensor_init();
     motor_control_init();
     DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
@@ -1001,9 +762,6 @@ int main(void)
     gButtonStable = gButtonRaw;
     gButtonRawChangedMs = 0U;
 
-    oled_init();
-    oled_write_text("0.0s");
-
     NVIC_ClearPendingIRQ(ENCODERA_INT_IRQN);
     NVIC_ClearPendingIRQ(ENCODERB_INT_IRQN);
     NVIC_ClearPendingIRQ(TIMER_0_INST_INT_IRQN);
@@ -1012,6 +770,7 @@ int main(void)
     NVIC_EnableIRQ(TIMER_0_INST_INT_IRQN);
     DL_TimerG_startCounter(TIMER_0_INST);
 
+    oled_init();
     __disable_irq();
     gControlTicksPending = 0U;
     __enable_irq();
@@ -1025,7 +784,6 @@ int main(void)
             __WFI();
         }
     }
-#endif
 }
 
 void TIMER_0_INST_IRQHandler(void)
@@ -1059,14 +817,4 @@ void GROUP1_IRQHandler(void)
         ENCODERA_E1A_PIN | ENCODERA_E1B_PIN);
     DL_GPIO_clearInterruptStatus(ENCODERB_PORT,
         ENCODERB_E2A_PIN | ENCODERB_E2B_PIN);
-}
-
-void UART_K230_INST_IRQHandler(void)
-{
-    ball_protocol_uart_isr();
-}
-
-void PWM_BALL_STEP_INST_IRQHandler(void)
-{
-    ball_rod_step_isr();
 }

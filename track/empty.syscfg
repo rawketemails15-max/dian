@@ -25,16 +25,11 @@ const GPIO8  = GPIO.addInstance();
 const GPIO9  = GPIO.addInstance();
 const GPIO10 = GPIO.addInstance();
 const GPIO11 = GPIO.addInstance();
-const GPIO12 = GPIO.addInstance();
-const GPIO13 = GPIO.addInstance();
 const PWM    = scripting.addModule("/ti/driverlib/PWM", {}, false);
 const PWM1   = PWM.addInstance();
-const PWM2   = PWM.addInstance();
 const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL");
 const TIMER  = scripting.addModule("/ti/driverlib/TIMER", {}, false);
 const TIMER1 = TIMER.addInstance();
-const UART   = scripting.addModule("/ti/driverlib/UART", {}, false);
-const UART1  = UART.addInstance();
 
 /**
  * Write custom configuration values to the imported modules.
@@ -123,16 +118,6 @@ GPIO11.associatedPins[0].$name        = "SDA";
 GPIO11.associatedPins[0].initialValue = "SET";
 GPIO11.associatedPins[0].pin.$assign  = "PA31";
 
-GPIO12.$name                         = "GPIO_BALL_DIR";
-GPIO12.port                          = "PORTB";
-GPIO12.associatedPins[0].$name       = "DIR";
-GPIO12.associatedPins[0].pin.$assign = "PB17";
-
-GPIO13.$name                         = "GPIO_D36A_EN";
-GPIO13.port                          = "PORTA";
-GPIO13.associatedPins[0].$name       = "EN";
-GPIO13.associatedPins[0].pin.$assign = "PA24";
-
 PWM1.$name                      = "PWM_0";
 PWM1.timerCount                 = 8000;
 PWM1.pwmMode                    = "EDGE_ALIGN_UP";
@@ -144,25 +129,6 @@ PWM1.PWM_CHANNEL_1.$name        = "ti_driverlib_pwm_PWMTimerCC1";
 PWM1.ccp0PinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric0";
 PWM1.ccp1PinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric1";
 
-PWM2.$name                              = "PWM_BALL_STEP";
-PWM2.clockDivider                       = 8;
-PWM2.timerCount                         = 40000;
-PWM2.ccIndex                            = [1];
-PWM2.enableShadowLoad                   = true;
-PWM2.interrupts                         = ["CC1_DN_EVENT"];
-PWM2.interruptPriority                  = "0";
-PWM2.ccp1PinConfig.direction            = scripting.forceWrite("OUTPUT");
-PWM2.ccp1PinConfig.hideOutputInversion  = scripting.forceWrite(false);
-PWM2.ccp1PinConfig.onlyInternalResistor = scripting.forceWrite(false);
-PWM2.ccp1PinConfig.passedPeripheralType = scripting.forceWrite("Digital");
-PWM2.ccp1PinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric5";
-PWM2.ccp1PinConfig.enableConfig         = true;
-PWM2.peripheral.$assign                 = "TIMG7";
-PWM2.peripheral.ccp1Pin.$assign         = "PB16";
-PWM2.PWM_CHANNEL_1.$name                = "ti_driverlib_pwm_PWMTimerCC2";
-PWM2.PWM_CHANNEL_1.ccValue              = 20000;
-PWM2.PWM_CHANNEL_1.shadowUpdateMode     = "ZERO_EVT";
-
 SYSCTL.forceDefaultClkConfig = true;
 
 TIMER1.$name              = "TIMER_0";
@@ -170,30 +136,7 @@ TIMER1.timerMode          = "PERIODIC";
 TIMER1.timerPeriod        = "5 ms";
 TIMER1.interrupts         = ["ZERO"];
 TIMER1.timerClkPrescale   = 4;
-TIMER1.interruptPriority  = "1";
 TIMER1.peripheral.$assign = "TIMG0";
-
-UART1.$name                            = "UART_K230";
-UART1.targetBaudRate                   = 115200;
-UART1.enableFIFO                       = true;
-UART1.enabledInterrupts                = ["RX"];
-UART1.rxFifoThreshold                  = "DL_UART_RX_FIFO_LEVEL_ONE_ENTRY";
-UART1.interruptPriority                = "2";
-UART1.peripheral.$assign               = "UART1";
-UART1.peripheral.rxPin.$assign         = "PB7";
-UART1.peripheral.txPin.$assign         = "PB6";
-UART1.txPinConfig.direction            = scripting.forceWrite("OUTPUT");
-UART1.txPinConfig.hideOutputInversion  = scripting.forceWrite(false);
-UART1.txPinConfig.onlyInternalResistor = scripting.forceWrite(false);
-UART1.txPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
-UART1.txPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric2";
-UART1.txPinConfig.enableConfig         = true;
-UART1.rxPinConfig.hideOutputInversion  = scripting.forceWrite(false);
-UART1.rxPinConfig.onlyInternalResistor = scripting.forceWrite(false);
-UART1.rxPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
-UART1.rxPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric3";
-UART1.rxPinConfig.enableConfig         = true;
-UART1.rxPinConfig.internalResistor     = "PULL_UP";
 
 const ProjectConfig              = scripting.addModule("/ti/project_config/ProjectConfig", {}, false);
 ProjectConfig.migrationCondition = true;

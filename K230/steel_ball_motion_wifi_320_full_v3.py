@@ -32,9 +32,10 @@ from media.media import *
 import nncase_runtime as nn
 import ulab.numpy as np
 import image
+from machine import FPIOA, UART
 
 
-# RTSP模块延迟到AP客户端接入后再加载，避免冷启动时过早初始化网络栈。
+# RTSP模块在AP就绪后加载；不等待电脑或手机先连接热点。
 mm = None
 
 
@@ -47,12 +48,7 @@ AP_PASSWORD = "12345678"
 AP_READY_TIMEOUT_MS = 10000
 AP_POLL_INTERVAL_MS = 200
 BOOT_SETTLE_MS = 3000
-AP_CLIENT_POLL_MS = 250
-AP_CLIENT_SETTLE_MS = 2000
-AP_STATUS_FALLBACK_SETTLE_MS = 8000
-AP_CLIENT_WAIT_TIMEOUT_MS = 15000
-
-SCRIPT_VERSION = "steel-ball-full-v3"
+SCRIPT_VERSION = "steel-ball-full-v3-uart-center"
 BOOT_LOG_PATH = "/sdcard/wifi_rtsp.log"
 BOOT_LOG_MAX_BYTES = 32768
 
@@ -110,6 +106,8 @@ MAX_ASPECT_RATIO = 2.00
 
 MARKER_SIZE = 10
 MARKER_COLOR = (255, 0, 255, 0)
+CENTER_LINE_COLOR = (255, 255, 0, 0)
+OSD_TEXT_COLOR = (255, 255, 255, 255)
 GC_INTERVAL = 180
 DISPLAY_MARKER_RETRY_MS = 1000
 
@@ -122,6 +120,15 @@ DISPLAY_MARKER_RETRY_MS = 1000
 # BALL,x,y,vx,vy,confidence,timestamp_us
 UDP_ENABLED = True
 UDP_PORT = 9000
+
+# K230 UART1: IO3/TX -> MSPM0 PB7/RX, IO4/RX <- MSPM0 PB6/TX.
+UART_TX_IO = 3
+UART_RX_IO = 4
+UART_BAUD_RATE = 115200
+UART_SEND_INTERVAL_MS = 33
+UART_PROTOCOL_VERSION = 0x01
+UART_MESSAGE_BALL_X = 0x03
+UART_BALL_CENTER_X = 160
 
 # Keep this False until the servos use an external regulated 5 V supply and
 # the external supply GND is connected to K230 GND. Set True after wiring.
@@ -239,74 +246,6 @@ def delay_with_exitpoint(delay_ms):
             pass
 
         time.sleep_ms(100)
-
-
-def get_ap_station_count(ap):
-    try:
-        stations = ap.status("stations")
-
-        if stations is None:
-            return 0
-
-        try:
-            return len(stations)
-        except Exception:
-            return 1 if stations else 0
-
-    except Exception:
-        # 部分Hiwonder固件只在AP模式实现isconnected()。
-        try:
-            return 1 if ap.isconnected() else 0
-        except Exception:
-            return None
-
-
-def wait_for_ap_client(ap):
-    print("等待电脑/手机连接K230热点后再启动识别与RTSP……")
-    wait_started_ms = time.ticks_ms()
-
-    while True:
-        station_count = get_ap_station_count(ap)
-
-        if station_count is None:
-            log_event(
-                "固件不支持查询AP客户端，等待%dms"
-                % AP_STATUS_FALLBACK_SETTLE_MS
-            )
-            delay_with_exitpoint(
-                AP_STATUS_FALLBACK_SETTLE_MS
-            )
-            return False
-
-        if station_count > 0:
-            log_event(
-                "检测到AP客户端%d个，等待网络路由稳定"
-                % station_count
-            )
-            delay_with_exitpoint(AP_CLIENT_SETTLE_MS)
-            return True
-
-        if (
-            time.ticks_diff(
-                time.ticks_ms(),
-                wait_started_ms
-            )
-            >= AP_CLIENT_WAIT_TIMEOUT_MS
-        ):
-            log_event(
-                "等待AP客户端超时，先启动LCD、识别和舵机；"
-                "电脑稍后仍可连接RTSP"
-            )
-            return False
-
-        try:
-            os.exitpoint()
-        except KeyboardInterrupt:
-            raise
-        except Exception:
-            pass
-
-        time.sleep_ms(AP_CLIENT_POLL_MS)
 
 
 def ensure_multimedia_loaded():
@@ -474,6 +413,142 @@ class UdpBallSender:
             except Exception:
                 pass
         self.sock = None
+
+
+class BallUartSender:
+    """Send the latest X coordinate as a fixed CRC-protected binary frame."""
+
+    def __init__(self):
+        self.uart = None
+        self.sequence = 0
+        self.last_send_ms = time.ticks_add(
+            time.ticks_ms(),
+            -UART_SEND_INTERVAL_MS
+        )
+        self.sent = 0
+        self.failures = 0
+
+        try:
+            fpioa = FPIOA()
+            fpioa.set_function(
+                UART_TX_IO,
+                FPIOA.UART1_TXD,
+                ie=0,
+                oe=1,
+                pu=0,
+                pd=0
+            )
+            fpioa.set_function(
+                UART_RX_IO,
+                FPIOA.UART1_RXD,
+                ie=1,
+                oe=0,
+                pu=1,
+                pd=0,
+                st=1
+            )
+            self.uart = UART(
+                UART.UART1,
+                baudrate=UART_BAUD_RATE,
+                bits=UART.EIGHTBITS,
+                parity=UART.PARITY_NONE,
+                stop=UART.STOPBITS_ONE,
+                timeout=2
+            )
+            print("UART1 ready: IO3 TX, IO4 RX, 115200 8N1")
+        except Exception as error:
+            self.uart = None
+            print("UART1坐标输出关闭:", error)
+
+    @staticmethod
+    def _crc16_ccitt_false(data, start, length):
+        crc = 0xFFFF
+
+        for index in range(start, start + length):
+            crc ^= data[index] << 8
+            for _ in range(8):
+                if crc & 0x8000:
+                    crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+                else:
+                    crc = (crc << 1) & 0xFFFF
+        return crc
+
+    @staticmethod
+    def _clamp(value, minimum, maximum):
+        if value < minimum:
+            return minimum
+        if value > maximum:
+            return maximum
+        return value
+
+    def send(self, motion):
+        now_ms = time.ticks_ms()
+        if (
+            time.ticks_diff(now_ms, self.last_send_ms)
+            < UART_SEND_INTERVAL_MS
+        ):
+            return
+        self.last_send_ms = now_ms
+
+        flags = 0
+        confidence = 0
+        x_q4 = 0
+        velocity_x = 0
+
+        if motion is not None:
+            flags = 0x01
+            if motion[4] <= 0.0:
+                flags |= 0x02
+            confidence = self._clamp(
+                int(motion[4] * 255.0 + 0.5),
+                0,
+                255
+            )
+            x_q4 = self._clamp(
+                int(motion[0] * 16.0 + 0.5),
+                0,
+                0xFFFF
+            )
+            velocity_x = self._clamp(
+                int(motion[2]),
+                -32768,
+                32767
+            )
+
+        frame = bytearray(15)
+        frame[0] = 0xA5
+        frame[1] = 0x5A
+        frame[2] = UART_PROTOCOL_VERSION
+        frame[3] = UART_MESSAGE_BALL_X
+        frame[4] = 8
+        frame[5] = self.sequence & 0xFF
+        frame[6] = (self.sequence >> 8) & 0xFF
+        frame[7] = flags
+        frame[8] = confidence
+        frame[9] = x_q4 & 0xFF
+        frame[10] = (x_q4 >> 8) & 0xFF
+        frame[11] = velocity_x & 0xFF
+        frame[12] = (velocity_x >> 8) & 0xFF
+        crc = self._crc16_ccitt_false(frame, 2, 11)
+        frame[13] = crc & 0xFF
+        frame[14] = (crc >> 8) & 0xFF
+
+        self.sequence = (self.sequence + 1) & 0xFFFF
+        if self.uart is None:
+            return
+        try:
+            self.uart.write(frame)
+            self.sent += 1
+        except Exception:
+            self.failures += 1
+
+    def close(self):
+        if self.uart is not None:
+            try:
+                self.uart.deinit()
+            except Exception:
+                pass
+        self.uart = None
 
 
 class BallServoController:
@@ -1660,7 +1735,7 @@ class CombinedMediaPipeline:
 # LCD识别标记
 # ============================================================
 
-def draw_marker(pipeline, motion):
+def draw_marker(pipeline, motion, uart_sender=None):
     global last_marker_update_ms
     global display_marker_enabled
     global display_marker_error_reported
@@ -1678,6 +1753,19 @@ def draw_marker(pipeline, motion):
         display_marker_enabled = True
 
     pipeline.osd_img.clear()
+    display_center_x = (
+        UART_BALL_CENTER_X
+        * DISPLAY_WIDTH
+        // AI_FRAME_SIZE[0]
+    )
+    pipeline.osd_img.draw_line(
+        display_center_x,
+        0,
+        display_center_x,
+        DISPLAY_HEIGHT - 1,
+        color=CENTER_LINE_COLOR,
+        thickness=2
+    )
 
     if motion is not None:
         center_x = int(
@@ -1717,6 +1805,41 @@ def draw_marker(pipeline, motion):
             color=MARKER_COLOR,
             thickness=2
         )
+        pipeline.osd_img.draw_string_advanced(
+            8,
+            8,
+            22,
+            "X:%.1f ERR:%+.1f%s"
+            % (
+                motion[0],
+                motion[0] - UART_BALL_CENTER_X,
+                " PRED" if motion[4] <= 0.0 else ""
+            ),
+            color=OSD_TEXT_COLOR
+        )
+    else:
+        pipeline.osd_img.draw_string_advanced(
+            8,
+            8,
+            22,
+            "BALL LOST",
+            color=OSD_TEXT_COLOR
+        )
+
+    if uart_sender is None or uart_sender.uart is None:
+        uart_text = "UART:OFF"
+    else:
+        uart_text = "TX:%d E:%d" % (
+            uart_sender.sent,
+            uart_sender.failures
+        )
+    pipeline.osd_img.draw_string_advanced(
+        8,
+        38,
+        20,
+        uart_text,
+        color=OSD_TEXT_COLOR
+    )
 
     try:
         pipeline.show_image()
@@ -1768,6 +1891,10 @@ def print_startup_summary(
     print("VENC缓冲:", VENC_BUFFER_COUNT)
     print("UDP坐标端口:", UDP_PORT)
     print(
+        "UART坐标:",
+        "IO3 TX -> PB7 RX, 115200 8N1, 约30Hz"
+    )
+    print(
         "舵机PWM:",
         "已启用" if SERVO_ENABLED else "安全关闭"
     )
@@ -1808,6 +1935,7 @@ def main():
     pipeline = None
     tracker = None
     udp = None
+    uart_sender = None
     servo = None
     restart_count = 0
 
@@ -1831,8 +1959,12 @@ def main():
 
         ap, ap_ip = start_ap()
         udp = UdpBallSender(ap_ip)
+        uart_sender = BallUartSender()
         servo = BallServoController()
-        wait_for_ap_client(ap)
+        log_event(
+            "AP已就绪，立即启动LCD、识别、UART与RTSP；"
+            "客户端可稍后连接"
+        )
 
         manual_url = (
             "rtsp://{}:{}/{}"
@@ -1912,7 +2044,12 @@ def main():
 
                     input_np = pipeline.get_frame()
                     motion = tracker.run(input_np)
-                    draw_marker(pipeline, motion)
+                    uart_sender.send(motion)
+                    draw_marker(
+                        pipeline,
+                        motion,
+                        uart_sender
+                    )
                     udp.send(motion)
                     servo_angles = servo.update(motion)
 
@@ -2092,10 +2229,14 @@ def main():
         if udp is not None:
             udp.close()
 
+        if uart_sender is not None:
+            uart_sender.close()
+
         tracker = None
         pipeline = None
         servo = None
         udp = None
+        uart_sender = None
         ap = None
         gc.collect()
 
