@@ -7,13 +7,15 @@
 #
 # 三路摄像头输出：
 #   通道0：800x480 YUV420 -> ST7701 LCD视频层
-#   通道1：640x480 YUV420 -> H.264 VENC -> RTSP（无识别标记）
+#   通道1：低延迟预设分辨率 YUV420 -> H.264 VENC -> RTSP（无识别标记）
 #   通道2：320x320 RGB888P -> KPU钢珠识别
 #
 # 电脑播放地址：
 #   rtsp://K230_IP:8554/ball
-# VLC直连热点建议强制RTSP/TCP：
-#   vlc --rtsp-tcp --network-caching=100 rtsp://K230_IP:8554/ball
+# VLC直连热点最低延迟优先使用UDP：
+#   vlc --network-caching=50 --live-caching=50 --clock-jitter=0
+#       --clock-synchro=0 --drop-late-frames --skip-frames
+#       rtsp://K230_IP:8554/ball
 # ============================================================
 
 import network
@@ -35,7 +37,7 @@ import image
 from machine import FPIOA, UART
 
 
-# RTSP模块在AP就绪后加载；不等待电脑或手机先连接热点。
+# 媒体管线在AP就绪后立即运行；RTSP等电脑或手机接入热点后再启用。
 mm = None
 
 
@@ -48,7 +50,10 @@ AP_PASSWORD = "12345678"
 AP_READY_TIMEOUT_MS = 10000
 AP_POLL_INTERVAL_MS = 200
 BOOT_SETTLE_MS = 3000
-SCRIPT_VERSION = "steel-ball-full-v3-uart-center-log3-brake"
+AP_CLIENT_POLL_MS = 250
+AP_CLIENT_SETTLE_MS = 500
+AP_STATUS_FALLBACK_SETTLE_MS = 8000
+SCRIPT_VERSION = "steel-ball-full-v3-uart-center-low-latency-v3-safe"
 BOOT_LOG_PATH = "/sdcard/wifi_rtsp.log"
 BOOT_LOG_MAX_BYTES = 32768
 
@@ -60,19 +65,52 @@ BOOT_LOG_MAX_BYTES = 32768
 RTSP_PORT = 8554
 RTSP_SESSION = "ball"
 
-VIDEO_WIDTH = 640
-VIDEO_HEIGHT = 480
-VIDEO_FPS = 30
-VIDEO_BIT_RATE = 1500
-VIDEO_GOP = 10
-VENC_BUFFER_COUNT = 4
+# 只改这一项即可切换图传档位：
+#   0 = 原始稳定参数
+#   1 = 安全低延迟（当前默认，保持已验证分辨率/帧率/缓冲数）
+#   2 = 激进低延迟（确认档位1能运行后再试）
+RTSP_LOW_LATENCY_PRESET = 2
 
-GET_STREAM_TIMEOUT_MS = 1000
+if RTSP_LOW_LATENCY_PRESET == 0:
+    VIDEO_WIDTH = 640
+    VIDEO_HEIGHT = 480
+    VIDEO_FPS = 30
+    VIDEO_BIT_RATE = 1500
+    VIDEO_GOP = 10
+    VENC_BUFFER_COUNT = 4
+    DISPLAY_MARKER_INTERVAL_MS = 33
+elif RTSP_LOW_LATENCY_PRESET == 1:
+    VIDEO_WIDTH = 640
+    VIDEO_HEIGHT = 480
+    VIDEO_FPS = 30
+    VIDEO_BIT_RATE = 1200
+    VIDEO_GOP = 5
+    VENC_BUFFER_COUNT = 4
+    DISPLAY_MARKER_INTERVAL_MS = 66
+elif RTSP_LOW_LATENCY_PRESET == 2:
+    VIDEO_WIDTH = 480
+    VIDEO_HEIGHT = 360
+    VIDEO_FPS = 20
+    VIDEO_BIT_RATE = 650
+    VIDEO_GOP = 4
+    VENC_BUFFER_COUNT = 2
+    DISPLAY_MARKER_INTERVAL_MS = 100
+else:
+    raise ValueError("RTSP_LOW_LATENCY_PRESET必须是0、1或2")
+
+# Sensor/KPU继续以30 FPS运行；只让VENC按VIDEO_FPS抽帧，
+# 避免为了图传降帧而降低钢珠识别和UART控制频率。
+SENSOR_FPS = 30
+
+GET_STREAM_TIMEOUT_MS = 200
 FIRST_FRAME_TIMEOUT_MS = 6000
-STREAM_STALL_TIMEOUT_MS = 15000
+STREAM_STALL_TIMEOUT_MS = 5000
 HEALTH_PRINT_INTERVAL_MS = 2000
 THREAD_STOP_TIMEOUT_MS = 3000
 RESTART_DELAY_MS = 2000
+RTSP_SLOW_SEND_MS = 100
+# K230 VENC的pts以微秒计，原生RTSP接口的timestamp以毫秒计。
+VENC_PTS_UNITS_PER_RTSP_MS = 1000
 
 
 # ============================================================
@@ -108,7 +146,7 @@ MARKER_SIZE = 10
 MARKER_COLOR = (255, 0, 255, 0)
 CENTER_LINE_COLOR = (255, 255, 0, 0)
 OSD_TEXT_COLOR = (255, 255, 255, 255)
-GC_INTERVAL = 180
+GC_INTERVAL = 300
 DISPLAY_MARKER_RETRY_MS = 1000
 
 
@@ -128,23 +166,7 @@ UART_BAUD_RATE = 115200
 UART_SEND_INTERVAL_MS = 33
 UART_PROTOCOL_VERSION = 0x01
 UART_MESSAGE_BALL_X = 0x03
-UART_MESSAGE_MSP_STATUS = 0x83
-UART_STATUS_PAYLOAD_SIZE = 36
-UART_STATUS_FRAME_SIZE = 43
 UART_BALL_CENTER_X = 160
-
-BALL_LOG_DIRECTORY = "/sdcard/ball_logs"
-BALL_LOG_PRETRIGGER_MS = 1000
-BALL_LOG_FLUSH_ROWS = 20
-BALL_LOG_FLUSH_MS = 1000
-BALL_LOG_SETTLED_CLOSE_MS = 3000
-BALL_LOG_MAX_RUN_MS = 60000
-BALL_CENTER_Q4 = 2560
-BALL_CENTER_SETTLE_Q4 = 40
-BALL_CENTER_MUST_CORRECT_Q4 = 61
-BALL_CENTER_STABLE_FRAMES = 15
-BALL_CENTER_ARM_FRAMES = 5
-BALL_MM_PER_PIXEL = 250.0 / 320.0
 
 # Keep this False until the servos use an external regulated 5 V supply and
 # the external supply GND is connected to K230 GND. Set True after wiring.
@@ -262,6 +284,27 @@ def delay_with_exitpoint(delay_ms):
             pass
 
         time.sleep_ms(100)
+
+
+def get_ap_station_count(ap):
+    """Return the AP station count, or None when the firmware cannot report it."""
+    try:
+        stations = ap.status("stations")
+
+        if stations is None:
+            return 0
+
+        try:
+            return len(stations)
+        except Exception:
+            return 1 if stations else 0
+
+    except Exception:
+        # Some Hiwonder firmware builds only expose isconnected() in AP mode.
+        try:
+            return 1 if ap.isconnected() else 0
+        except Exception:
+            return None
 
 
 def ensure_multimedia_loaded():
@@ -432,7 +475,7 @@ class UdpBallSender:
 
 
 class BallUartSender:
-    """Bidirectional CRC-framed link between K230 and MSPM0."""
+    """Send the latest X coordinate as a fixed CRC-protected binary frame."""
 
     def __init__(self):
         self.uart = None
@@ -443,18 +486,6 @@ class BallUartSender:
         )
         self.sent = 0
         self.failures = 0
-        self.last_vision_sequence = 0
-        self.rx_buffer = bytearray()
-        self.latest_status = None
-        self.status_frames = 0
-        self.status_crc_errors = 0
-        self.status_format_errors = 0
-        self.status_sequence_drops = 0
-        self.status_resets = 0
-        self.status_raw_bytes = 0
-        self.have_status_sequence = False
-        self.last_status_sequence = 0
-        self.last_status_msp_ms = None
 
         try:
             fpioa = FPIOA()
@@ -561,7 +592,6 @@ class BallUartSender:
         frame[13] = crc & 0xFF
         frame[14] = (crc >> 8) & 0xFF
 
-        self.last_vision_sequence = self.sequence
         self.sequence = (self.sequence + 1) & 0xFFFF
         if self.uart is None:
             return
@@ -571,174 +601,6 @@ class BallUartSender:
         except Exception:
             self.failures += 1
 
-    @staticmethod
-    def _u16(data, index):
-        return data[index] | (data[index + 1] << 8)
-
-    @classmethod
-    def _i16(cls, data, index):
-        value = cls._u16(data, index)
-        return value - 65536 if value & 0x8000 else value
-
-    @staticmethod
-    def _u32(data, index):
-        return (
-            data[index]
-            | (data[index + 1] << 8)
-            | (data[index + 2] << 16)
-            | (data[index + 3] << 24)
-        )
-
-    def _discard_rx(self, count):
-        """CanMV bytearray has no CPython-style item deletion."""
-        if count <= 0:
-            return
-        if count >= len(self.rx_buffer):
-            self.rx_buffer = bytearray()
-        else:
-            self.rx_buffer = bytearray(self.rx_buffer[count:])
-
-    def _decode_status(self, frame):
-        sequence = self._u16(frame, 5)
-        msp_ms = self._u32(frame, 9)
-        msp_reset = (
-            self.last_status_msp_ms is not None
-            and msp_ms + 100 < self.last_status_msp_ms
-        )
-        if msp_reset:
-            self.status_resets += 1
-            self.have_status_sequence = False
-
-        if self.have_status_sequence:
-            expected = (self.last_status_sequence + 1) & 0xFFFF
-            if sequence != expected:
-                self.status_sequence_drops += (
-                    sequence - expected
-                ) & 0xFFFF
-        self.have_status_sequence = True
-        self.last_status_sequence = sequence
-        self.last_status_msp_ms = msp_ms
-
-        flags = self._u16(frame, 15)
-        status = {
-            "sequence": sequence,
-            "run_id": self._u16(frame, 7),
-            "msp_ms": msp_ms,
-            "msp_reset": 1 if msp_reset else 0,
-            "status_resets": self.status_resets,
-            "state": frame[13],
-            "phase": frame[14],
-            "flags": flags,
-            "current_steps": self._i16(frame, 17),
-            "target_steps": self._i16(frame, 19),
-            "error_q4": self._i16(frame, 21),
-            "filtered_velocity": self._i16(frame, 23),
-            "step_hz": self._u16(frame, 25),
-            "tilt_limit": self._u16(frame, 27),
-            "recovery_phase": frame[29],
-            "arm_frames": frame[30],
-            "crc_errors": self._u16(frame, 31),
-            "sequence_drops": self._u16(frame, 33),
-            "rx_overflows": self._u16(frame, 35),
-            "tx_drops": self._u16(frame, 37),
-            "event": frame[39],
-            "en": 1 if flags & 0x0001 else 0,
-            "step_running": 1 if flags & 0x0002 else 0,
-            "vision_fresh": 1 if flags & 0x0004 else 0,
-            "settled": 1 if flags & 0x0008 else 0,
-            "must_correct": 1 if flags & 0x0010 else 0,
-            "approaching": 1 if flags & 0x0020 else 0,
-            "recovery": 1 if flags & 0x0040 else 0,
-            "at_limit": 1 if flags & 0x0080 else 0
-        }
-        status["received_ms"] = time.ticks_ms()
-        current_steps = status["current_steps"]
-        target_steps = status["target_steps"]
-        status["dir"] = (
-            1 if target_steps > current_steps
-            else (-1 if target_steps < current_steps else 0)
-        )
-        return status
-
-    def poll_status(self):
-        events = []
-        if self.uart is None:
-            return events
-
-        try:
-            data = self.uart.read()
-        except Exception:
-            self.status_format_errors += 1
-            return events
-
-        if data:
-            self.status_raw_bytes += len(data)
-            self.rx_buffer.extend(data)
-            if len(self.rx_buffer) > 512:
-                self.rx_buffer = bytearray(self.rx_buffer[-128:])
-                self.status_format_errors += 1
-
-        while len(self.rx_buffer) >= 2:
-            if (
-                self.rx_buffer[0] != 0xA5
-                or self.rx_buffer[1] != 0x5A
-            ):
-                header_index = -1
-                for index in range(1, len(self.rx_buffer) - 1):
-                    if (
-                        self.rx_buffer[index] == 0xA5
-                        and self.rx_buffer[index + 1] == 0x5A
-                    ):
-                        header_index = index
-                        break
-                if header_index < 0:
-                    keep_last = self.rx_buffer[-1] == 0xA5
-                    self.rx_buffer = (
-                        bytearray([0xA5])
-                        if keep_last
-                        else bytearray()
-                    )
-                    self.status_format_errors += 1
-                    break
-                self._discard_rx(header_index)
-                self.status_format_errors += 1
-
-            if len(self.rx_buffer) < 5:
-                break
-            if (
-                self.rx_buffer[2] != UART_PROTOCOL_VERSION
-                or self.rx_buffer[3] != UART_MESSAGE_MSP_STATUS
-                or self.rx_buffer[4] != UART_STATUS_PAYLOAD_SIZE
-            ):
-                self._discard_rx(1)
-                self.status_format_errors += 1
-                continue
-            if len(self.rx_buffer) < UART_STATUS_FRAME_SIZE:
-                break
-
-            frame = self.rx_buffer[:UART_STATUS_FRAME_SIZE]
-            received_crc = (
-                frame[41] | (frame[42] << 8)
-            )
-            calculated_crc = self._crc16_ccitt_false(
-                frame,
-                2,
-                39
-            )
-            if received_crc != calculated_crc:
-                self._discard_rx(1)
-                self.status_crc_errors += 1
-                continue
-
-            self._discard_rx(UART_STATUS_FRAME_SIZE)
-            status = self._decode_status(frame)
-            self.latest_status = status
-            self.status_frames += 1
-            if status["event"] or status["msp_reset"]:
-                events.append(status)
-
-        return events
-
     def close(self):
         if self.uart is not None:
             try:
@@ -746,391 +608,6 @@ class BallUartSender:
             except Exception:
                 pass
         self.uart = None
-
-
-class BallRunLogger:
-    """Buffered one-run CSV logger; every SD failure is non-fatal."""
-
-    EVENT_NAMES = {
-        1: "CENTER_START",
-        2: "CENTER_SETTLED",
-        3: "CORRECTION_RESUME",
-        4: "RECOVERY_BACKOFF",
-        5: "RECOVERY_REAPPLY",
-        6: "VISION_FAULT",
-        7: "CENTER_END",
-        8: "DOUBLE_CLICK_OVERRIDE",
-        9: "CENTER_LEVELING"
-    }
-    CSV_HEADER = (
-        "run_ms,event,vision_seq,real/pred/lost,"
-        "x_q4,x_px,y_px,vx,confidence,"
-        "msp_ms,status_sequence,run_id,state,phase,error_q4,"
-        "filtered_velocity,current_steps,target_steps,"
-        "step_hz,dir,en,step_running,vision_fresh,settled,"
-        "must_correct,approaching,recovery_phase,tilt_limit,"
-        "crc_errors,sequence_drops,rx_overflows,tx_drops,"
-        "status_crc_errors,status_format_errors,"
-        "status_sequence_drops,status_resets\n"
-    )
-
-    def __init__(self):
-        self.file = None
-        self.path = None
-        self.active = False
-        self.run_start_ms = 0
-        self.run_id = 0
-        self.buffer = []
-        self.pretrigger = []
-        self.last_flush_ms = time.ticks_ms()
-        self.settled_since_ms = None
-        self.last_seen_run_id = 0
-
-    @staticmethod
-    def _status_copy(status):
-        return status.copy() if status is not None else {}
-
-    def _snapshot(self, now_ms, motion, uart_link, event_text=""):
-        return (
-            now_ms,
-            motion,
-            uart_link.last_vision_sequence,
-            self._status_copy(uart_link.latest_status),
-            event_text,
-            uart_link.status_crc_errors,
-            uart_link.status_format_errors,
-            uart_link.status_sequence_drops,
-            uart_link.status_resets
-        )
-
-    @staticmethod
-    def _field(status, name):
-        value = status.get(name, "")
-        return value
-
-    def _format_row(self, sample):
-        (
-            sample_ms,
-            motion,
-            vision_sequence,
-            status,
-            event_text,
-            status_crc_errors,
-            status_format_errors,
-            status_sequence_drops,
-            status_resets
-        ) = sample
-        run_ms = time.ticks_diff(sample_ms, self.run_start_ms)
-
-        if motion is None:
-            vision_kind = "lost"
-            x_q4 = ""
-            x_px = ""
-            y_px = ""
-            velocity_x = ""
-            confidence = ""
-        else:
-            vision_kind = "pred" if motion[4] <= 0.0 else "real"
-            x_q4 = int(motion[0] * 16.0 + 0.5)
-            x_px = "%.3f" % motion[0]
-            y_px = "%.3f" % motion[1]
-            velocity_x = "%.3f" % motion[2]
-            confidence = "%.4f" % motion[4]
-
-        fields = [
-            run_ms,
-            event_text,
-            vision_sequence,
-            vision_kind,
-            x_q4,
-            x_px,
-            y_px,
-            velocity_x,
-            confidence,
-            self._field(status, "msp_ms"),
-            self._field(status, "sequence"),
-            self._field(status, "run_id"),
-            self._field(status, "state"),
-            self._field(status, "phase"),
-            self._field(status, "error_q4"),
-            self._field(status, "filtered_velocity"),
-            self._field(status, "current_steps"),
-            self._field(status, "target_steps"),
-            self._field(status, "step_hz"),
-            self._field(status, "dir"),
-            self._field(status, "en"),
-            self._field(status, "step_running"),
-            self._field(status, "vision_fresh"),
-            self._field(status, "settled"),
-            self._field(status, "must_correct"),
-            self._field(status, "approaching"),
-            self._field(status, "recovery_phase"),
-            self._field(status, "tilt_limit"),
-            self._field(status, "crc_errors"),
-            self._field(status, "sequence_drops"),
-            self._field(status, "rx_overflows"),
-            self._field(status, "tx_drops"),
-            status_crc_errors,
-            status_format_errors,
-            status_sequence_drops,
-            status_resets
-        ]
-        return ",".join([str(value) for value in fields]) + "\n"
-
-    @staticmethod
-    def _ensure_directory():
-        try:
-            os.stat(BALL_LOG_DIRECTORY)
-        except Exception:
-            os.mkdir(BALL_LOG_DIRECTORY)
-
-    @classmethod
-    def _next_path(cls):
-        cls._ensure_directory()
-        maximum = 0
-        for name in os.listdir(BALL_LOG_DIRECTORY):
-            if not (
-                name.startswith("run_")
-                and name.endswith(".csv")
-            ):
-                continue
-            try:
-                number = int(name[4:-4])
-                if number > maximum:
-                    maximum = number
-            except Exception:
-                pass
-        return "%s/run_%04d.csv" % (
-            BALL_LOG_DIRECTORY,
-            maximum + 1
-        )
-
-    def _metadata(self):
-        return (
-            "# script_version=%s\n"
-            "# protocol_version=%d\n"
-            "# center_q4=%d\n"
-            "# millimeters_per_pixel=%.6f\n"
-            "# settle_error_q4=%d\n"
-            "# must_correct_q4=%d\n"
-            "# stable_real_frames=%d\n"
-            "# arm_real_frames=%d\n"
-            "# no_progress_real_frames=3\n"
-            "# forced_nudge_steps=4\n"
-            "# far_zone_q4_gt=480 initial_tilt_steps=48\n"
-            "# fine_zone_q4_le=480 fine_tilt_steps=24\n"
-            "# crossing_brake_steps=8 crossing_hz=160\n"
-            "# leveling_target=button_reference leveling_hz=220\n"
-            "# fine_step_hz=80 bias_decay_steps_per_real_frame=2\n"
-            "# tilt_max_steps=120 increment=12\n"
-            "# forced_action_min_interval_ms=500\n"
-            "# recovery=backoff12_then_reapply interval_ms=500\n"
-            "# vision_hold_ms=150 vision_fault_ms=1000\n"
-            "# log_settled_close_ms=3000 log_max_run_ms=60000\n"
-            % (
-                SCRIPT_VERSION,
-                UART_PROTOCOL_VERSION,
-                BALL_CENTER_Q4,
-                BALL_MM_PER_PIXEL,
-                BALL_CENTER_SETTLE_Q4,
-                BALL_CENTER_MUST_CORRECT_Q4,
-                BALL_CENTER_STABLE_FRAMES,
-                BALL_CENTER_ARM_FRAMES
-            )
-        )
-
-    def _disable_after_write_error(self, error):
-        path = self.path
-        try:
-            if self.file is not None:
-                self.file.close()
-        except Exception:
-            pass
-        self.file = None
-        self.active = False
-        self.buffer = []
-        self.settled_since_ms = None
-        log_event(
-            "ball CSV disabled path=%s error=%s"
-            % (path, error)
-        )
-
-    def _flush(self, force=False):
-        if not self.active or self.file is None:
-            return
-        now_ms = time.ticks_ms()
-        if (
-            not force
-            and len(self.buffer) < BALL_LOG_FLUSH_ROWS
-            and time.ticks_diff(now_ms, self.last_flush_ms)
-                < BALL_LOG_FLUSH_MS
-        ):
-            return
-        if not self.buffer:
-            return
-        try:
-            self.file.write("".join(self.buffer))
-            self.buffer = []
-            try:
-                self.file.flush()
-            except Exception:
-                pass
-            self.last_flush_ms = now_ms
-        except Exception as error:
-            self._disable_after_write_error(error)
-
-    def _start_run(self, status, now_ms):
-        if self.active:
-            self.close("new_center_start")
-        try:
-            self.path = self._next_path()
-            self.file = open(self.path, "w")
-            self.file.write(self._metadata())
-            self.file.write(
-                "# msp_run_id=%d\n"
-                % status.get("run_id", 0)
-            )
-            self.file.write(self.CSV_HEADER)
-            self.active = True
-            self.run_start_ms = now_ms
-            self.run_id = status.get("run_id", 0)
-            self.last_seen_run_id = self.run_id
-            self.last_flush_ms = now_ms
-            self.settled_since_ms = None
-            for sample in self.pretrigger:
-                self.buffer.append(self._format_row(sample))
-            self.pretrigger = []
-            self._flush(force=True)
-            log_event(
-                "ball CSV start path=%s run_id=%d"
-                % (self.path, self.run_id)
-            )
-        except Exception as error:
-            self._disable_after_write_error(error)
-
-    def close(self, reason):
-        if not self.active:
-            return
-        path = self.path
-        self._flush(force=True)
-        if self.file is not None:
-            try:
-                self.file.write("# close_reason=%s\n" % reason)
-                try:
-                    self.file.flush()
-                except Exception:
-                    pass
-                self.file.close()
-            except Exception as error:
-                self._disable_after_write_error(error)
-                return
-        self.file = None
-        self.active = False
-        self.buffer = []
-        self.settled_since_ms = None
-        log_event(
-            "ball CSV closed path=%s reason=%s"
-            % (path, reason)
-        )
-
-    def record(self, motion, uart_link, events):
-        now_ms = time.ticks_ms()
-        event_names = []
-        close_reason = None
-        saw_msp_reset = False
-
-        for status in events:
-            if status.get("msp_reset", 0):
-                event_names.append("MSP_RESET")
-                close_reason = "msp_reset_manual_stop"
-                saw_msp_reset = True
-                continue
-            event = status.get("event", 0)
-            if event:
-                name = self.EVENT_NAMES.get(
-                    event,
-                    "EVENT_%d" % event
-                )
-                event_names.append(name)
-            if event == 1:
-                self._start_run(status, now_ms)
-            elif event == 6:
-                close_reason = "vision_fault"
-            elif event == 8:
-                close_reason = "double_click_override"
-
-        latest_status = uart_link.latest_status
-        if latest_status is not None and not saw_msp_reset:
-            latest_run_id = latest_status.get("run_id", 0)
-            if (
-                latest_run_id != self.last_seen_run_id
-                and latest_status.get("phase") == 1
-            ):
-                event_names.append("CENTER_START_INFERRED")
-                self._start_run(latest_status, now_ms)
-                self.last_seen_run_id = latest_run_id
-
-        event_text = "|".join(event_names)
-        sample = self._snapshot(
-            now_ms,
-            motion,
-            uart_link,
-            event_text
-        )
-
-        if not self.active:
-            self.pretrigger.append(sample)
-            while (
-                self.pretrigger
-                and time.ticks_diff(
-                    now_ms,
-                    self.pretrigger[0][0]
-                ) > BALL_LOG_PRETRIGGER_MS
-            ):
-                del self.pretrigger[0]
-            return
-
-        self.buffer.append(self._format_row(sample))
-        status = latest_status
-        if status is not None:
-            if (
-                close_reason is None
-                and status.get("state") in (4, 5)
-            ):
-                close_reason = "control_fault"
-            if (
-                close_reason is None
-                and status.get("settled", 0)
-                and abs(status.get("error_q4", 32767))
-                    < BALL_CENTER_MUST_CORRECT_Q4
-                and status.get("vision_fresh", 0)
-                and time.ticks_diff(
-                    now_ms,
-                    status.get("received_ms", 0)
-                ) < 200
-            ):
-                if self.settled_since_ms is None:
-                    self.settled_since_ms = now_ms
-                elif time.ticks_diff(
-                    now_ms,
-                    self.settled_since_ms
-                ) >= BALL_LOG_SETTLED_CLOSE_MS:
-                    close_reason = "settled_3s"
-            else:
-                self.settled_since_ms = None
-
-        if (
-            close_reason is None
-            and time.ticks_diff(
-                now_ms,
-                self.run_start_ms
-            ) >= BALL_LOG_MAX_RUN_MS
-        ):
-            close_reason = "run_limit_60s"
-
-        self._flush()
-        if close_reason is not None:
-            self.close(close_reason)
 
 
 class BallServoController:
@@ -1660,6 +1137,11 @@ class CombinedMediaPipeline:
         self.rtsp_initialized = False
         self.rtsp_started = False
         self.session_created = False
+        self.rtsp_feed_enabled = False
+        self.rtsp_wait_started_ms = 0
+        self.rtsp_client_seen_ms = None
+        self.rtsp_last_poll_ms = 0
+        self.rtsp_status_fallback_logged = False
 
         self.stream_thread_started = False
         self.start_stream = False
@@ -1672,6 +1154,13 @@ class CombinedMediaPipeline:
         self.last_stream_ms = 0
         self.get_stream_failures = 0
         self.rtsp_send_failures = 0
+        self.rtsp_sent_frames = 0
+        self.rtsp_discarded_frames = 0
+        self.rtsp_timestamp_origin_ms = 0
+        self.rtsp_last_timestamp_ms = 0
+        self.rtsp_last_send_duration_ms = 0
+        self.rtsp_max_send_duration_ms = 0
+        self.rtsp_slow_send_count = 0
         self.last_rtsp_send_error_ms = 0
         self.thread_error = None
 
@@ -1691,7 +1180,7 @@ class CombinedMediaPipeline:
             id=SENSOR_ID,
             width=SENSOR_INPUT_WIDTH,
             height=SENSOR_INPUT_HEIGHT,
-            fps=VIDEO_FPS
+            fps=SENSOR_FPS
         )
         self.sensor.reset()
 
@@ -1800,7 +1289,7 @@ class CombinedMediaPipeline:
             self.video_height,
             VIDEO_BIT_RATE,
             VIDEO_GOP,
-            VIDEO_FPS,
+            SENSOR_FPS,
             VIDEO_FPS
         )
 
@@ -1848,6 +1337,106 @@ class CombinedMediaPipeline:
 
         print("RTSP服务启动完成")
 
+    def poll_rtsp_client(self, ap):
+        """Non-blocking AP-client gate for RTSP while vision keeps running."""
+        now_ms = time.ticks_ms()
+
+        if (
+            time.ticks_diff(
+                now_ms,
+                self.rtsp_last_poll_ms
+            )
+            < AP_CLIENT_POLL_MS
+        ):
+            return False
+
+        self.rtsp_last_poll_ms = now_ms
+        station_count = get_ap_station_count(ap)
+
+        if station_count is None:
+            if not self.rtsp_status_fallback_logged:
+                self.rtsp_status_fallback_logged = True
+                print(
+                    "固件无法查询热点客户端，"
+                    "%dms后按兼容模式启用RTSP"
+                    % AP_STATUS_FALLBACK_SETTLE_MS
+                )
+                log_event(
+                    "固件无法查询AP客户端，等待%dms后启用RTSP"
+                    % AP_STATUS_FALLBACK_SETTLE_MS
+                )
+
+            if (
+                not self.rtsp_feed_enabled
+                and time.ticks_diff(
+                    now_ms,
+                    self.rtsp_wait_started_ms
+                )
+                >= AP_STATUS_FALLBACK_SETTLE_MS
+            ):
+                if not self.rtsp_started:
+                    self._start_rtsp_server()
+                self.rtsp_feed_enabled = True
+                print("RTSP兼容模式已启用，从当前编码帧开始发送")
+                log_event("RTSP兼容模式已启用，从当前编码帧开始发送")
+                return True
+
+            return False
+
+        self.rtsp_status_fallback_logged = False
+
+        if station_count <= 0:
+            self.rtsp_client_seen_ms = None
+
+            if self.rtsp_feed_enabled:
+                # The encoder thread keeps draining VENC while disconnected.
+                # This prevents old H.264 frames from accumulating for replay.
+                self.rtsp_feed_enabled = False
+                print("热点客户端已断开，暂停RTSP投递并丢弃旧编码帧")
+                log_event("热点客户端已断开，RTSP暂停投递")
+
+            return False
+
+        if self.rtsp_feed_enabled:
+            return False
+
+        if self.rtsp_client_seen_ms is None:
+            self.rtsp_client_seen_ms = now_ms
+            print(
+                "检测到热点客户端%d个，等待网络稳定……"
+                % station_count
+            )
+            log_event(
+                "检测到AP客户端%d个，等待网络稳定"
+                % station_count
+            )
+            return False
+
+        if (
+            time.ticks_diff(
+                now_ms,
+                self.rtsp_client_seen_ms
+            )
+            < AP_CLIENT_SETTLE_MS
+        ):
+            return False
+
+        if not self.rtsp_started:
+            self._start_rtsp_server()
+
+        # Set this only after the RTSP session is completely ready. The
+        # encoder thread cannot feed a half-initialized network service.
+        self.rtsp_feed_enabled = True
+        official_url = self.get_rtsp_url()
+        print("RTSP已启用，从当前编码帧开始发送")
+        if official_url:
+            print("RTSP地址:", official_url)
+        log_event(
+            "RTSP已启用，从当前编码帧开始发送 url=%s"
+            % (official_url if official_url else "unknown")
+        )
+        return True
+
     def _start_media_stream(self):
         print("正在启动H.264编码器……")
         self.encoder.Start(self.venc_chn)
@@ -1869,16 +1458,27 @@ class CombinedMediaPipeline:
         self.last_stream_ms = 0
         self.get_stream_failures = 0
         self.rtsp_send_failures = 0
+        self.rtsp_sent_frames = 0
+        self.rtsp_discarded_frames = 0
+        self.rtsp_timestamp_origin_ms = 0
+        self.rtsp_last_timestamp_ms = 0
+        self.rtsp_last_send_duration_ms = 0
+        self.rtsp_max_send_duration_ms = 0
+        self.rtsp_slow_send_count = 0
         self.last_rtsp_send_error_ms = 0
         self.thread_error = None
         self.health_sample_ms = time.ticks_ms()
         self.health_sample_frames = 0
         self.health_sample_bytes = 0
         self.runthread_over = False
+        self.rtsp_feed_enabled = False
+        self.rtsp_wait_started_ms = 0
+        self.rtsp_client_seen_ms = None
+        self.rtsp_last_poll_ms = 0
+        self.rtsp_status_fallback_logged = False
 
         try:
             self._configure_media()
-            self._start_rtsp_server()
             self._start_media_stream()
 
             self.start_stream = True
@@ -1921,12 +1521,16 @@ class CombinedMediaPipeline:
             self.health_sample_ms = time.ticks_ms()
             self.health_sample_frames = self.encoded_frames
             self.health_sample_bytes = self.encoded_bytes
+            self.rtsp_timestamp_origin_ms = self.health_sample_ms
+            self.rtsp_wait_started_ms = self.health_sample_ms
+            self.rtsp_last_poll_ms = time.ticks_add(
+                self.rtsp_wait_started_ms,
+                -AP_CLIENT_POLL_MS
+            )
             self.server_started = True
 
-            print(
-                "已取得H.264首帧，字节数:",
-                self.encoded_bytes
-            )
+            print("已取得H.264编码首帧，字节数:", self.encoded_bytes)
+            print("RTSP等待热点客户端，等待期间编码帧将立即释放")
 
         except BaseException as error:
             self.start_stream = False
@@ -1966,6 +1570,61 @@ class CombinedMediaPipeline:
 
                     stream_received = True
                     frame_bytes = 0
+                    frame_sent = False
+                    send_this_frame = self.rtsp_feed_enabled
+                    frame_pts = 0
+
+                    # v1.4-19固件没有在本板运行时验证过
+                    # STREAM_TYPE_HEADER/I名称，不能让编码线程依赖它们。
+                    # 使用短GOP，让播放器最多等待很短时间便取得下一I帧。
+                    for pack_index in range(
+                        stream_data.pack_cnt
+                    ):
+                        packet_size = (
+                            stream_data.data_size[pack_index]
+                        )
+
+                        if packet_size <= 0:
+                            continue
+
+                        frame_bytes += packet_size
+                        packet_pts = stream_data.pts[pack_index]
+                        if not frame_pts and packet_pts > 0:
+                            frame_pts = packet_pts
+
+                    frame_timestamp_ms = 0
+                    send_started_ms = 0
+                    send_failed = False
+
+                    if send_this_frame:
+                        now_ms = time.ticks_ms()
+
+                        if frame_pts > 0:
+                            # VENC PTS与正在发送的编码帧严格对应；旧版固定
+                            # 1000会破坏播放器的实时播放时钟。
+                            frame_timestamp_ms = (
+                                frame_pts
+                                // VENC_PTS_UNITS_PER_RTSP_MS
+                            )
+                        else:
+                            # 极少数固件/首包没有PTS时仍保持单调毫秒时钟。
+                            frame_timestamp_ms = time.ticks_diff(
+                                now_ms,
+                                self.rtsp_timestamp_origin_ms
+                            )
+
+                        if frame_timestamp_ms < 0:
+                            frame_timestamp_ms = 0
+
+                        if (
+                            frame_timestamp_ms
+                            <= self.rtsp_last_timestamp_ms
+                        ):
+                            frame_timestamp_ms = (
+                                self.rtsp_last_timestamp_ms + 1
+                            )
+
+                        send_started_ms = now_ms
 
                     for pack_index in range(
                         stream_data.pack_cnt
@@ -1977,47 +1636,85 @@ class CombinedMediaPipeline:
                         if packet_size <= 0:
                             continue
 
-                        packet = bytes(
-                            uctypes.bytearray_at(
-                                stream_data.data[pack_index],
-                                packet_size
+                        if send_this_frame and not send_failed:
+                            packet = bytes(
+                                uctypes.bytearray_at(
+                                    stream_data.data[pack_index],
+                                    packet_size
+                                )
                             )
+                            try:
+                                send_result = (
+                                    self.rtsp_server
+                                    .rtspserver_sendvideodata(
+                                        self.session_name,
+                                        packet,
+                                        packet_size,
+                                        frame_timestamp_ms
+                                    )
+                                )
+                                if send_result not in (None, 0):
+                                    raise RuntimeError(
+                                        "RTSP返回错误码%d"
+                                        % send_result
+                                    )
+                                frame_sent = True
+                            except Exception as error:
+                                # Keep draining VENC on a socket failure so
+                                # LCD, recognition and UART never stop.
+                                send_failed = True
+                                self.rtsp_send_failures += 1
+                                now_ms = time.ticks_ms()
+                                if (
+                                    not self.last_rtsp_send_error_ms
+                                    or time.ticks_diff(
+                                        now_ms,
+                                        self.last_rtsp_send_error_ms
+                                    )
+                                    >= HEALTH_PRINT_INTERVAL_MS
+                                ):
+                                    self.last_rtsp_send_error_ms = now_ms
+                                    print(
+                                        "RTSP发送暂时失败，"
+                                        "LCD/识别/UART继续:",
+                                        error
+                                    )
+
+                    if (
+                        frame_sent
+                        and not send_failed
+                    ):
+                        self.rtsp_last_timestamp_ms = (
+                            frame_timestamp_ms
+                        )
+                        send_duration_ms = time.ticks_diff(
+                            time.ticks_ms(),
+                            send_started_ms
+                        )
+                        self.rtsp_last_send_duration_ms = (
+                            send_duration_ms
                         )
 
-                        frame_bytes += packet_size
-                        try:
-                            self.rtsp_server.rtspserver_sendvideodata(
-                                self.session_name,
-                                packet,
-                                packet_size,
-                                1000
+                        if (
+                            send_duration_ms
+                            > self.rtsp_max_send_duration_ms
+                        ):
+                            self.rtsp_max_send_duration_ms = (
+                                send_duration_ms
                             )
-                        except Exception as error:
-                            # VLC closing or Wi-Fi roaming may reset the RTSP
-                            # socket. Keep draining VENC so LCD/AI/servo never
-                            # stop; the RTSP server accepts a later reconnect.
-                            self.rtsp_send_failures += 1
-                            now_ms = time.ticks_ms()
-                            if (
-                                not self.last_rtsp_send_error_ms
-                                or time.ticks_diff(
-                                    now_ms,
-                                    self.last_rtsp_send_error_ms
-                                )
-                                >= HEALTH_PRINT_INTERVAL_MS
-                            ):
-                                self.last_rtsp_send_error_ms = now_ms
-                                print(
-                                    "RTSP客户端暂时断开，"
-                                    "LCD/识别/舵机继续:",
-                                    error
-                                )
+
+                        if send_duration_ms >= RTSP_SLOW_SEND_MS:
+                            self.rtsp_slow_send_count += 1
 
                     if frame_bytes > 0:
                         self.encoded_frames += 1
                         self.encoded_bytes += frame_bytes
                         self.last_stream_ms = time.ticks_ms()
                         self.first_frame_ready = True
+                        if frame_sent and not send_failed:
+                            self.rtsp_sent_frames += 1
+                        else:
+                            self.rtsp_discarded_frames += 1
 
                 finally:
                     if stream_received:
@@ -2153,14 +1850,31 @@ class CombinedMediaPipeline:
 
         print(
             "[HEALTH] fps=%.1f bitrate=%.0fkbps "
-            "frames=%d bytes=%d get_fail=%d send_fail=%d thread=%s"
+            "frames=%d bytes=%d rtsp_sent=%d dropped=%d "
+            "get_fail=%d send_fail=%d "
+            "send_ms=%d max_send_ms=%d slow=%d "
+            "rtsp=%s thread=%s"
             % (
                 fps,
                 kbps,
                 self.encoded_frames,
                 self.encoded_bytes,
+                self.rtsp_sent_frames,
+                self.rtsp_discarded_frames,
                 self.get_stream_failures,
                 self.rtsp_send_failures,
+                self.rtsp_last_send_duration_ms,
+                self.rtsp_max_send_duration_ms,
+                self.rtsp_slow_send_count,
+                (
+                    "SEND"
+                    if self.rtsp_feed_enabled
+                    else (
+                        "READY"
+                        if self.rtsp_started
+                        else "WAIT"
+                    )
+                ),
                 (
                     "RUN"
                     if not self.runthread_over
@@ -2174,6 +1888,9 @@ class CombinedMediaPipeline:
         self.health_sample_bytes = self.encoded_bytes
 
     def get_rtsp_url(self):
+        if not self.rtsp_started:
+            return None
+
         try:
             return (
                 self.rtsp_server
@@ -2192,6 +1909,7 @@ class CombinedMediaPipeline:
 
     def _release_resources(self):
         print("正在释放识别与图传资源……")
+        self.rtsp_feed_enabled = False
 
         # 清理阶段禁止新的IDE退出点异常打断资源释放。
         try:
@@ -2304,6 +2022,7 @@ class CombinedMediaPipeline:
         self.stream_thread_started = False
         self.server_started = False
         self.runthread_over = True
+        self.rtsp_client_seen_ms = None
 
         gc.collect()
         print("识别与图传资源释放完成")
@@ -2333,6 +2052,18 @@ def draw_marker(pipeline, motion, uart_sender=None):
         ):
             return
         display_marker_enabled = True
+
+    now_ms = time.ticks_ms()
+    if (
+        last_marker_update_ms
+        and time.ticks_diff(
+            now_ms,
+            last_marker_update_ms
+        )
+        < DISPLAY_MARKER_INTERVAL_MS
+    ):
+        return
+    last_marker_update_ms = now_ms
 
     pipeline.osd_img.clear()
     display_center_x = (
@@ -2411,10 +2142,9 @@ def draw_marker(pipeline, motion, uart_sender=None):
     if uart_sender is None or uart_sender.uart is None:
         uart_text = "UART:OFF"
     else:
-        uart_text = "TX:%d RX:%d C:%d" % (
+        uart_text = "TX:%d E:%d" % (
             uart_sender.sent,
-            uart_sender.status_frames,
-            uart_sender.status_crc_errors
+            uart_sender.failures
         )
     pipeline.osd_img.draw_string_advanced(
         8,
@@ -2449,7 +2179,7 @@ def print_startup_summary(
 
     print()
     print("========================================")
-    print("钢珠识别与原始画面无线图传启动成功")
+    print("钢珠识别与H.264编码管线启动成功")
     print("编码首帧自检: PASS")
     print()
     print("LCD:")
@@ -2461,6 +2191,7 @@ def print_startup_summary(
     )
     print()
     print("RTSP:")
+    print("低延迟档位:", RTSP_LOW_LATENCY_PRESET)
     print(
         VIDEO_WIDTH,
         "x",
@@ -2469,9 +2200,20 @@ def print_startup_summary(
         VIDEO_FPS,
         "FPS，无识别标记"
     )
+    print("Sensor/识别帧率:", SENSOR_FPS, "FPS")
     print("码率:", VIDEO_BIT_RATE, "kbps")
     print("GOP:", VIDEO_GOP)
     print("VENC缓冲:", VENC_BUFFER_COUNT)
+    print("RTSP时间戳: VENC PTS转毫秒，缺失时单调时钟回退")
+    print("LCD标记刷新间隔:", DISPLAY_MARKER_INTERVAL_MS, "ms")
+    print(
+        "RTSP状态:",
+        (
+            "已启用，发送当前帧"
+            if pipeline.rtsp_feed_enabled
+            else "等待热点客户端，旧编码帧不缓存"
+        )
+    )
     print("UDP坐标端口:", UDP_PORT)
     print(
         "UART坐标:",
@@ -2489,9 +2231,17 @@ def print_startup_summary(
     print("VLC网络串流地址:")
     print(manual_url)
     print()
-    print("VLC建议命令:")
+    print("VLC最低延迟命令（UDP优先）:")
     print(
-        'vlc --rtsp-tcp --network-caching=100 "%s"'
+        'vlc --no-audio --network-caching=50 --live-caching=50 '
+        '--clock-jitter=0 --clock-synchro=0 --drop-late-frames '
+        '--skip-frames "%s"'
+        % manual_url
+    )
+    print("VLC抗丢包命令（UDP花屏时改TCP）:")
+    print(
+        'vlc --no-audio --rtsp-tcp --network-caching=100 '
+        '--live-caching=100 --drop-late-frames --skip-frames "%s"'
         % manual_url
     )
 
@@ -2519,7 +2269,6 @@ def main():
     tracker = None
     udp = None
     uart_sender = None
-    run_logger = None
     servo = None
     restart_count = 0
 
@@ -2544,7 +2293,6 @@ def main():
         ap, ap_ip = start_ap()
         udp = UdpBallSender(ap_ip)
         uart_sender = BallUartSender()
-        run_logger = BallRunLogger()
         servo = BallServoController()
         log_event(
             "AP已就绪，立即启动LCD、识别、UART与RTSP；"
@@ -2595,6 +2343,7 @@ def main():
                     port=RTSP_PORT
                 )
                 pipeline.start()
+                pipeline.poll_rtsp_client(ap)
                 display_marker_enabled = True
                 display_marker_error_reported = False
                 display_marker_last_error_ms = 0
@@ -2602,6 +2351,7 @@ def main():
                 tracker = SingleBallTracker(
                     KMODEL_PATH
                 )
+                pipeline.poll_rtsp_client(ap)
 
                 print_startup_summary(
                     pipeline,
@@ -2610,7 +2360,7 @@ def main():
                 )
 
                 log_event(
-                    "识别和RTSP首帧自检通过 "
+                    "识别和H.264编码首帧自检通过 "
                     "url=%s restart=%d"
                     % (
                         manual_url,
@@ -2630,12 +2380,6 @@ def main():
                     input_np = pipeline.get_frame()
                     motion = tracker.run(input_np)
                     uart_sender.send(motion)
-                    status_events = uart_sender.poll_status()
-                    run_logger.record(
-                        motion,
-                        uart_sender,
-                        status_events
-                    )
                     draw_marker(
                         pipeline,
                         motion,
@@ -2643,6 +2387,7 @@ def main():
                     )
                     udp.send(motion)
                     servo_angles = servo.update(motion)
+                    pipeline.poll_rtsp_client(ap)
 
                     frame_count += 1
                     total_frame_count += 1
@@ -2709,8 +2454,6 @@ def main():
                 raise
 
             except BaseException as error:
-                if run_logger is not None:
-                    run_logger.close("vision_or_media_fault")
                 try:
                     log_event(
                         "识别或媒体链路失败 "
@@ -2822,9 +2565,6 @@ def main():
         if udp is not None:
             udp.close()
 
-        if run_logger is not None:
-            run_logger.close("script_exit")
-
         if uart_sender is not None:
             uart_sender.close()
 
@@ -2832,7 +2572,6 @@ def main():
         pipeline = None
         servo = None
         udp = None
-        run_logger = None
         uart_sender = None
         ap = None
         gc.collect()
