@@ -6,6 +6,7 @@
 
 typedef enum {
     BALL_ROD_IDLE = 0,
+    BALL_ROD_TRIM,
     BALL_ROD_WAKE,
     BALL_ROD_LAUNCH,
     BALL_ROD_LAUNCH_HOLD,
@@ -20,14 +21,18 @@ typedef enum {
 
 typedef struct {
     BallRodState state;
+    /* Physical microstep position relative to MCU power-on. */
     int32_t currentSteps;
     int32_t targetSteps;
+    int32_t runZeroSteps;
     uint32_t runElapsedMs;
     uint16_t stepFrequencyHz;
+    int8_t trimDirection;
     uint8_t directionLevel;
     bool driverEnabled;
     bool stepRunning;
     bool sequenceTimedOut;
+    bool adjustmentUiActive;
 } BallRodTelemetry;
 
 void ball_rod_init(uint32_t nowMs);

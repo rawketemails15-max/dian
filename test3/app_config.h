@@ -6,19 +6,23 @@
  * OPEN LOOP USER TUNING
  * ================================================================
  *
- * Before every BLS start, manually make the pipe horizontal and put
- * the ball at O.  Change only one parameter at a time.
+ * Electrically trim the pipe horizontal before every double-click start,
+ * then put the ball at O.  Change only one parameter at a time.
  */
 #define APP_BALL_DIR_INVERT                    (0U)
-#define APP_OL_LAUNCH_STEPS                    (104)
+#define APP_OL_LAUNCH_STEPS                    (112)
 #define APP_OL_LAUNCH_HOLD_MS                  (0U)
 #define APP_OL_REVERSE_STEPS                   (-48)
-#define APP_OL_RETURN_HOLD_MS                  (1500U)
+#define APP_OL_RETURN_HOLD_MS                  (1000U)
 #define APP_OL_LAUNCH_HZ                       (240U)
 #define APP_OL_REVERSE_HZ                      (300U)
 #define APP_OL_LEVEL_HZ                        (240U)
 #define APP_OL_FINAL_SETTLE_MS                 (1000U)
 #define APP_OL_RUN_TIMEOUT_MS                  (4500U)
+#define APP_TRIM_STEP_SIZE                     (4)
+#define APP_TRIM_HZ                            (120U)
+#define APP_BUTTON_LONG_PRESS_MS               (1000U)
+#define APP_BUTTON_DOUBLE_CLICK_MS             (350U)
 
 /* Fixed control, hardware and safety constants. */
 #define APP_CONTROL_TICK_MS                    (5U)
@@ -92,6 +96,20 @@
 #if ((APP_OL_LEVEL_HZ < APP_BALL_STEP_MIN_HZ) || \
      (APP_OL_LEVEL_HZ > APP_BALL_STEP_MAX_HZ))
 #error "APP_OL_LEVEL_HZ must be between 80 and 300 Hz"
+#endif
+
+#if (APP_TRIM_STEP_SIZE <= 0)
+#error "APP_TRIM_STEP_SIZE must be positive"
+#endif
+
+#if ((APP_TRIM_HZ < APP_BALL_STEP_MIN_HZ) || \
+     (APP_TRIM_HZ > APP_BALL_STEP_MAX_HZ))
+#error "APP_TRIM_HZ must be between 80 and 300 Hz"
+#endif
+
+#if ((APP_BUTTON_DOUBLE_CLICK_MS <= APP_BUTTON_DEBOUNCE_MS) || \
+     (APP_BUTTON_LONG_PRESS_MS <= APP_BUTTON_DOUBLE_CLICK_MS))
+#error "Button timing must satisfy debounce < double-click < long-press"
 #endif
 
 #if (APP_OL_RUN_TIMEOUT_MS >= 5000U)

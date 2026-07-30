@@ -15,11 +15,27 @@ static uint16_t gCommandFrequencyHz;
 static uint32_t gStateStartMs;
 static uint32_t gRunStartMs;
 static uint32_t gFinalRunMs;
+static int32_t gRunZeroSteps;
+static int8_t gTrimDirection;
+static bool gAdjustmentUiActive;
 
 static bool gButtonRaw;
 static bool gButtonStable;
+static bool gButtonRawPressEligible;
 static bool gButtonPressEligible;
+static bool gButtonLongHandled;
+static bool gSecondClickCandidate;
+static bool gClickPending;
 static uint32_t gButtonRawChangedMs;
+static uint32_t gButtonPressStartMs;
+static uint32_t gFirstClickReleaseMs;
+
+typedef enum {
+    BUTTON_GESTURE_NONE = 0,
+    BUTTON_GESTURE_TRIM,
+    BUTTON_GESTURE_TOGGLE_DIRECTION,
+    BUTTON_GESTURE_START
+} ButtonGesture;
 
 static bool elapsed_ms(
     uint32_t nowMs, uint32_t startMs, uint32_t durationMs)
@@ -196,52 +212,143 @@ static void set_motion_target(
     move_toward_target();
 }
 
-static bool button_pressed_event(uint32_t nowMs, bool pressed)
+static bool state_accepts_gestures(BallRodState state)
 {
+    return (state == BALL_ROD_IDLE) ||
+        (state == BALL_ROD_TRIM) ||
+        (state == BALL_ROD_COMPLETE);
+}
+
+static bool state_is_sequence_running(BallRodState state)
+{
+    switch (state) {
+        case BALL_ROD_WAKE:
+        case BALL_ROD_LAUNCH:
+        case BALL_ROD_LAUNCH_HOLD:
+        case BALL_ROD_REVERSE:
+        case BALL_ROD_RETURN_HOLD:
+        case BALL_ROD_LEVEL:
+        case BALL_ROD_SETTLE:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+static void clear_pending_gestures(void)
+{
+    gButtonRawPressEligible = false;
+    gButtonPressEligible = false;
+    gButtonLongHandled = false;
+    gSecondClickCandidate = false;
+    gClickPending = false;
+}
+
+static ButtonGesture button_gesture_tick(
+    uint32_t nowMs, bool pressed, bool gesturesAllowed)
+{
+    ButtonGesture gesture = BUTTON_GESTURE_NONE;
+
     if (pressed != gButtonRaw) {
         gButtonRaw = pressed;
         gButtonRawChangedMs = nowMs;
         if (pressed) {
-            /*
-             * Remember where the physical press began.  A press that begins
-             * during a run stays blocked even if its debounce interval ends
-             * after the controller has entered COMPLETE.
-             */
-            gButtonPressEligible =
-                (gState == BALL_ROD_IDLE) ||
-                (gState == BALL_ROD_COMPLETE);
-        } else {
-            gButtonPressEligible = false;
+            gButtonRawPressEligible = gesturesAllowed;
+        }
+
+        /*
+         * A raw second press that begins inside the double-click window keeps
+         * the first click from firing while this new edge is being debounced.
+         */
+        if (pressed && gesturesAllowed && gClickPending &&
+            ((uint32_t) (nowMs - gFirstClickReleaseMs) <=
+                APP_BUTTON_DOUBLE_CLICK_MS)) {
+            gSecondClickCandidate = true;
         }
     }
 
     if ((gButtonStable != gButtonRaw) &&
         elapsed_ms(nowMs, gButtonRawChangedMs, APP_BUTTON_DEBOUNCE_MS)) {
         gButtonStable = gButtonRaw;
-        if (gButtonStable && gButtonPressEligible) {
+
+        if (gButtonStable) {
+            gButtonPressEligible =
+                gesturesAllowed && gButtonRawPressEligible;
+            gButtonLongHandled = false;
+            gButtonPressStartMs = nowMs;
+
+            if (!gClickPending) {
+                gSecondClickCandidate = false;
+            }
+        } else {
+            if (gButtonPressEligible && !gButtonLongHandled) {
+                if (gSecondClickCandidate && gClickPending) {
+                    gClickPending = false;
+                    gSecondClickCandidate = false;
+                    gesture = BUTTON_GESTURE_START;
+                } else {
+                    gClickPending = true;
+                    gFirstClickReleaseMs = nowMs;
+                }
+            }
             gButtonPressEligible = false;
-            return true;
+            gButtonLongHandled = false;
+            gButtonRawPressEligible = false;
         }
     }
-    return false;
-}
 
-static bool state_is_running(BallRodState state)
-{
-    return (state >= BALL_ROD_WAKE) && (state <= BALL_ROD_SETTLE);
+    if (!gesturesAllowed) {
+        clear_pending_gestures();
+        return BUTTON_GESTURE_NONE;
+    }
+
+    if (gButtonStable && gButtonPressEligible &&
+        !gButtonLongHandled &&
+        elapsed_ms(nowMs, gButtonPressStartMs,
+            APP_BUTTON_LONG_PRESS_MS)) {
+        gButtonLongHandled = true;
+        gClickPending = false;
+        gSecondClickCandidate = false;
+        return BUTTON_GESTURE_TOGGLE_DIRECTION;
+    }
+
+    /*
+     * If a raw second press bounced away before becoming stable, release the
+     * candidate after its falling edge has itself remained stable.
+     */
+    if (gSecondClickCandidate && !gButtonStable && !gButtonRaw &&
+        elapsed_ms(nowMs, gButtonRawChangedMs,
+            APP_BUTTON_DEBOUNCE_MS)) {
+        gSecondClickCandidate = false;
+    }
+
+    if ((gesture == BUTTON_GESTURE_NONE) && gClickPending &&
+        !gSecondClickCandidate &&
+        elapsed_ms(nowMs, gFirstClickReleaseMs,
+            APP_BUTTON_DOUBLE_CLICK_MS)) {
+        gClickPending = false;
+        gesture = BUTTON_GESTURE_TRIM;
+    }
+
+    return gesture;
 }
 
 static void start_sequence(uint32_t nowMs)
 {
     /*
-     * The user guarantees that the pipe is horizontal and the ball is at O
-     * when BLS is pressed.  A previous completed run also ends at zero steps.
+     * The double-click captures the electrically trimmed physical position as
+     * this run's horizontal zero.  Keep the power-on-relative step count so
+     * every later target can still obey the calibrated global soft travel.
      */
     step_pin_gpio_low();
+    gRunZeroSteps = gCurrentSteps;
     gTargetSteps = gCurrentSteps;
     gTelemetry.sequenceTimedOut = false;
     gRunStartMs = nowMs;
     gFinalRunMs = 0U;
+    gAdjustmentUiActive = false;
+    clear_pending_gestures();
 
     set_direction_for_sign(1);
     DL_GPIO_setPins(GPIO_D36A_EN_PORT, GPIO_D36A_EN_EN_PIN);
@@ -253,7 +360,36 @@ static void start_timeout_level(uint32_t nowMs)
 {
     gTelemetry.sequenceTimedOut = true;
     set_motion_target(
-        BALL_ROD_TIMEOUT_LEVEL, 0, APP_OL_LEVEL_HZ, nowMs);
+        BALL_ROD_TIMEOUT_LEVEL, gRunZeroSteps, APP_OL_LEVEL_HZ, nowMs);
+}
+
+static void start_trim_move(uint32_t nowMs)
+{
+    step_pin_gpio_low();
+    gAdjustmentUiActive = true;
+    if (((gTrimDirection > 0) &&
+            (gCurrentSteps >= APP_BALL_MAX_STEPS)) ||
+        ((gTrimDirection < 0) &&
+            (gCurrentSteps <= APP_BALL_MIN_STEPS))) {
+        if (gState == BALL_ROD_COMPLETE) {
+            set_state(BALL_ROD_IDLE, nowMs);
+        }
+        return;
+    }
+
+    set_motion_target(
+        BALL_ROD_TRIM,
+        gCurrentSteps + gTrimDirection * APP_TRIM_STEP_SIZE,
+        APP_TRIM_HZ, nowMs);
+}
+
+static void toggle_trim_direction(uint32_t nowMs)
+{
+    gTrimDirection = (int8_t) -gTrimDirection;
+    gAdjustmentUiActive = true;
+    if (gState == BALL_ROD_COMPLETE) {
+        set_state(BALL_ROD_IDLE, nowMs);
+    }
 }
 
 void ball_rod_init(uint32_t nowMs)
@@ -268,34 +404,60 @@ void ball_rod_init(uint32_t nowMs)
     gStateStartMs = nowMs;
     gRunStartMs = nowMs;
     gFinalRunMs = 0U;
+    gRunZeroSteps = 0;
+    gTrimDirection = 1;
+    gAdjustmentUiActive = true;
 
     gButtonRaw = false;
     gButtonStable = false;
+    gButtonRawPressEligible = false;
     gButtonPressEligible = false;
+    gButtonLongHandled = false;
+    gSecondClickCandidate = false;
+    gClickPending = false;
     gButtonRawChangedMs = nowMs;
+    gButtonPressStartMs = nowMs;
+    gFirstClickReleaseMs = nowMs;
 
     gTelemetry = (BallRodTelemetry) {0};
     gTelemetry.state = BALL_ROD_IDLE;
+    gTelemetry.trimDirection = gTrimDirection;
+    gTelemetry.adjustmentUiActive = true;
 
     step_pin_gpio_low();
     DL_GPIO_clearPins(GPIO_BALL_DIR_PORT, GPIO_BALL_DIR_DIR_PIN);
-    DL_GPIO_clearPins(GPIO_D36A_EN_PORT, GPIO_D36A_EN_EN_PIN);
+    /*
+     * Keep D36A awake from MCU startup.  With the driver's separate power
+     * switch on, BLS trim moves can establish the physical horizontal point.
+     * The power-on position remains the global step-count origin.
+     */
+    DL_GPIO_setPins(GPIO_D36A_EN_PORT, GPIO_D36A_EN_EN_PIN);
+    gTelemetry.driverEnabled = true;
 }
 
 void ball_rod_tick_5ms(uint32_t nowMs, bool buttonPressed)
 {
-    bool pressedEvent = button_pressed_event(nowMs, buttonPressed);
+    ButtonGesture gesture = button_gesture_tick(
+        nowMs, buttonPressed, state_accepts_gestures(gState));
 
-    /*
-     * Per the selected behavior, every press during a running sequence is
-     * ignored.  IDLE and COMPLETE are the only startable states.
-     */
-    if (pressedEvent &&
-        ((gState == BALL_ROD_IDLE) || (gState == BALL_ROD_COMPLETE))) {
-        start_sequence(nowMs);
+    switch (gesture) {
+        case BUTTON_GESTURE_TRIM:
+            start_trim_move(nowMs);
+            break;
+
+        case BUTTON_GESTURE_TOGGLE_DIRECTION:
+            toggle_trim_direction(nowMs);
+            break;
+
+        case BUTTON_GESTURE_START:
+            start_sequence(nowMs);
+            break;
+
+        default:
+            break;
     }
 
-    if (state_is_running(gState) &&
+    if (state_is_sequence_running(gState) &&
         elapsed_ms(nowMs, gRunStartMs, APP_OL_RUN_TIMEOUT_MS)) {
         start_timeout_level(nowMs);
     }
@@ -307,11 +469,19 @@ void ball_rod_tick_5ms(uint32_t nowMs, bool buttonPressed)
             step_pin_gpio_low();
             break;
 
+        case BALL_ROD_TRIM:
+            move_toward_target();
+            if (target_reached()) {
+                set_state(BALL_ROD_IDLE, nowMs);
+            }
+            break;
+
         case BALL_ROD_WAKE:
             if (elapsed_ms(nowMs, gStateStartMs,
                     APP_D36A_WAKE_DELAY_MS)) {
                 set_motion_target(BALL_ROD_LAUNCH,
-                    APP_OL_LAUNCH_STEPS, APP_OL_LAUNCH_HZ, nowMs);
+                    gRunZeroSteps + APP_OL_LAUNCH_STEPS,
+                    APP_OL_LAUNCH_HZ, nowMs);
             }
             break;
 
@@ -320,7 +490,8 @@ void ball_rod_tick_5ms(uint32_t nowMs, bool buttonPressed)
             if (target_reached()) {
                 if (APP_OL_LAUNCH_HOLD_MS == 0U) {
                     set_motion_target(BALL_ROD_REVERSE,
-                        APP_OL_REVERSE_STEPS, APP_OL_REVERSE_HZ, nowMs);
+                        gRunZeroSteps + APP_OL_REVERSE_STEPS,
+                        APP_OL_REVERSE_HZ, nowMs);
                 } else {
                     set_state(BALL_ROD_LAUNCH_HOLD, nowMs);
                 }
@@ -332,7 +503,8 @@ void ball_rod_tick_5ms(uint32_t nowMs, bool buttonPressed)
             if (elapsed_ms(nowMs, gStateStartMs,
                     APP_OL_LAUNCH_HOLD_MS)) {
                 set_motion_target(BALL_ROD_REVERSE,
-                    APP_OL_REVERSE_STEPS, APP_OL_REVERSE_HZ, nowMs);
+                    gRunZeroSteps + APP_OL_REVERSE_STEPS,
+                    APP_OL_REVERSE_HZ, nowMs);
             }
             break;
 
@@ -347,8 +519,8 @@ void ball_rod_tick_5ms(uint32_t nowMs, bool buttonPressed)
             step_pin_gpio_low();
             if (elapsed_ms(nowMs, gStateStartMs,
                     APP_OL_RETURN_HOLD_MS)) {
-                set_motion_target(
-                    BALL_ROD_LEVEL, 0, APP_OL_LEVEL_HZ, nowMs);
+                set_motion_target(BALL_ROD_LEVEL,
+                    gRunZeroSteps, APP_OL_LEVEL_HZ, nowMs);
             }
             break;
 
@@ -383,9 +555,12 @@ void ball_rod_tick_5ms(uint32_t nowMs, bool buttonPressed)
 
     gTelemetry.currentSteps = gCurrentSteps;
     gTelemetry.targetSteps = gTargetSteps;
+    gTelemetry.runZeroSteps = gRunZeroSteps;
     gTelemetry.stepFrequencyHz = gStepFrequencyHz;
+    gTelemetry.trimDirection = gTrimDirection;
     gTelemetry.stepRunning = gStepRunning;
-    if (state_is_running(gState) ||
+    gTelemetry.adjustmentUiActive = gAdjustmentUiActive;
+    if (state_is_sequence_running(gState) ||
         (gState == BALL_ROD_TIMEOUT_LEVEL)) {
         gTelemetry.runElapsedMs = (uint32_t) (nowMs - gRunStartMs);
     } else {
@@ -417,8 +592,11 @@ BallRodTelemetry ball_rod_get_telemetry(void)
     telemetry = gTelemetry;
     telemetry.currentSteps = gCurrentSteps;
     telemetry.targetSteps = gTargetSteps;
+    telemetry.runZeroSteps = gRunZeroSteps;
     telemetry.stepFrequencyHz = gStepFrequencyHz;
+    telemetry.trimDirection = gTrimDirection;
     telemetry.stepRunning = gStepRunning;
+    telemetry.adjustmentUiActive = gAdjustmentUiActive;
     if (primask == 0U) {
         __enable_irq();
     }

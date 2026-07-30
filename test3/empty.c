@@ -38,18 +38,23 @@
 #define DISPLAY_SDA_PORT OLED_SDA_PORT
 #define DISPLAY_SDA_PIN  OLED_SDA_SDA_PIN
 
-#define OLED_WIDTH_PIXELS      (128U)
-#define OLED_SCALE             (5U)
-#define OLED_FONT_HEIGHT       (7U)
-#define OLED_FIRST_PAGE        (1U)
-#define OLED_RENDER_PAGE_COUNT (5U)
-#define OLED_TOP_PIXEL         (12U)
-#define OLED_HALF_CLOCK_CYCLES (CPUCLK_FREQ / 4000000U)
+#define OLED_WIDTH_PIXELS       (128U)
+#define OLED_HEIGHT_PIXELS      (64U)
+#define OLED_PAGE_COUNT         (8U)
+#define OLED_FONT_HEIGHT        (7U)
+#define OLED_TIME_SCALE         (5U)
+#define OLED_TRIM_HEADER_SCALE  (2U)
+#define OLED_TRIM_VALUE_SCALE   (4U)
+#define OLED_TIME_TOP_PIXEL     (12U)
+#define OLED_TRIM_HEADER_TOP    (2U)
+#define OLED_TRIM_VALUE_TOP     (31U)
+#define OLED_HALF_CLOCK_CYCLES  (CPUCLK_FREQ / 4000000U)
 
 static volatile uint32_t gMs;
 static volatile uint8_t gControlTicksPending;
 static uint32_t gLastOledUpdateMs;
 static uint32_t gFaultLedLastToggleMs;
+static uint8_t gOledPixels[OLED_PAGE_COUNT][OLED_WIDTH_PIXELS];
 
 static bool elapsed_ms(uint32_t startMs, uint32_t durationMs)
 {
@@ -173,7 +178,7 @@ static void oled_init(void)
 
 static const uint8_t *oled_glyph(char character, uint8_t *width)
 {
-    static const char characters[] = "0123456789.Ers";
+    static const char characters[] = "0123456789.ErsDIR+-";
     static const uint8_t glyphs[][3] = {
         {0x7FU, 0x41U, 0x7FU},
         {0x42U, 0x7FU, 0x40U},
@@ -189,6 +194,11 @@ static const uint8_t *oled_glyph(char character, uint8_t *width)
         {0x7FU, 0x49U, 0x49U},
         {0x7CU, 0x04U, 0x04U},
         {0x4FU, 0x49U, 0x79U},
+        {0x7FU, 0x41U, 0x3EU},
+        {0x41U, 0x7FU, 0x41U},
+        {0x7FU, 0x09U, 0x76U},
+        {0x08U, 0x1CU, 0x08U},
+        {0x08U, 0x08U, 0x08U},
     };
     static const uint8_t blank[3] = {0U, 0U, 0U};
 
@@ -203,7 +213,7 @@ static const uint8_t *oled_glyph(char character, uint8_t *width)
     return blank;
 }
 
-static uint8_t oled_text_width(const char *text)
+static uint16_t oled_text_width(const char *text, uint8_t scale)
 {
     uint16_t width = 0U;
 
@@ -211,25 +221,29 @@ static uint8_t oled_text_width(const char *text)
         uint8_t glyphWidth;
 
         (void) oled_glyph(*text++, &glyphWidth);
-        width += (uint16_t) glyphWidth * OLED_SCALE;
+        width += (uint16_t) glyphWidth * scale;
         if (*text != '\0') {
-            width += OLED_SCALE;
+            width += scale;
         }
     }
-    return (uint8_t) width;
+    return width;
 }
 
-static void oled_write_text(const char *text)
+static void oled_frame_clear(void)
 {
-    static uint8_t pixels[OLED_RENDER_PAGE_COUNT][OLED_WIDTH_PIXELS];
-    uint8_t textWidth = oled_text_width(text);
-    uint8_t x = (uint8_t) ((OLED_WIDTH_PIXELS - textWidth) / 2U);
-
-    for (uint8_t page = 0U; page < OLED_RENDER_PAGE_COUNT; page++) {
+    for (uint8_t page = 0U; page < OLED_PAGE_COUNT; page++) {
         for (uint8_t column = 0U; column < OLED_WIDTH_PIXELS; column++) {
-            pixels[page][column] = 0U;
+            gOledPixels[page][column] = 0U;
         }
     }
+}
+
+static void oled_draw_text_centered(
+    const char *text, uint8_t scale, uint8_t topPixel)
+{
+    uint16_t textWidth = oled_text_width(text, scale);
+    uint16_t x = (textWidth < OLED_WIDTH_PIXELS) ?
+        (OLED_WIDTH_PIXELS - textWidth) / 2U : 0U;
 
     while (*text != '\0') {
         uint8_t glyphWidth;
@@ -237,40 +251,83 @@ static void oled_write_text(const char *text)
 
         for (uint8_t glyphColumn = 0U;
              glyphColumn < glyphWidth; glyphColumn++) {
-            for (uint8_t xScale = 0U; xScale < OLED_SCALE; xScale++) {
-                uint8_t outputX = (uint8_t) (x + xScale);
+            for (uint8_t xScale = 0U; xScale < scale; xScale++) {
+                uint16_t outputX = x + xScale;
 
                 for (uint8_t glyphRow = 0U;
                      glyphRow < OLED_FONT_HEIGHT; glyphRow++) {
                     if ((glyph[glyphColumn] &
                             (uint8_t) (1U << glyphRow)) != 0U) {
                         for (uint8_t yScale = 0U;
-                             yScale < OLED_SCALE; yScale++) {
-                            uint8_t outputY = (uint8_t)
-                                (OLED_TOP_PIXEL +
-                                    glyphRow * OLED_SCALE + yScale);
-                            uint8_t outputPage =
-                                (uint8_t) (outputY / 8U);
+                             yScale < scale; yScale++) {
+                            uint16_t outputY = topPixel +
+                                glyphRow * scale + yScale;
 
-                            pixels[outputPage - OLED_FIRST_PAGE][outputX] |=
-                                (uint8_t) (1U << (outputY % 8U));
+                            if ((outputX < OLED_WIDTH_PIXELS) &&
+                                (outputY < OLED_HEIGHT_PIXELS)) {
+                                gOledPixels[outputY / 8U][outputX] |=
+                                    (uint8_t) (1U << (outputY % 8U));
+                            }
                         }
                     }
                 }
             }
-            x = (uint8_t) (x + OLED_SCALE);
+            x += scale;
         }
         if (*text != '\0') {
-            x = (uint8_t) (x + OLED_SCALE);
+            x += scale;
         }
+    }
+}
+
+static void oled_flush(void)
+{
+    for (uint8_t page = 0U; page < OLED_PAGE_COUNT; page++) {
+        oled_set_position(0U, page);
+        for (uint8_t column = 0U; column < OLED_WIDTH_PIXELS; column++) {
+            oled_write_byte(gOledPixels[page][column], true);
+        }
+    }
+}
+
+static void oled_write_text(const char *text)
+{
+    oled_frame_clear();
+    oled_draw_text_centered(text, OLED_TIME_SCALE, OLED_TIME_TOP_PIXEL);
+    oled_flush();
+}
+
+static void oled_write_adjustment(int8_t direction, int32_t positionSteps)
+{
+    char directionText[5] = {'D', 'I', 'R', '+', '\0'};
+    char positionText[5];
+    uint32_t magnitude;
+
+    if (direction < 0) {
+        directionText[3] = '-';
     }
 
-    for (uint8_t page = 0U; page < OLED_RENDER_PAGE_COUNT; page++) {
-        oled_set_position(0U, (uint8_t) (OLED_FIRST_PAGE + page));
-        for (uint8_t column = 0U; column < OLED_WIDTH_PIXELS; column++) {
-            oled_write_byte(pixels[page][column], true);
-        }
+    if (positionSteps < 0) {
+        positionText[0] = '-';
+        magnitude = (uint32_t) -positionSteps;
+    } else {
+        positionText[0] = '+';
+        magnitude = (uint32_t) positionSteps;
     }
+    if (magnitude > 999U) {
+        magnitude = 999U;
+    }
+    positionText[1] = (char) ('0' + ((magnitude / 100U) % 10U));
+    positionText[2] = (char) ('0' + ((magnitude / 10U) % 10U));
+    positionText[3] = (char) ('0' + (magnitude % 10U));
+    positionText[4] = '\0';
+
+    oled_frame_clear();
+    oled_draw_text_centered(
+        directionText, OLED_TRIM_HEADER_SCALE, OLED_TRIM_HEADER_TOP);
+    oled_draw_text_centered(
+        positionText, OLED_TRIM_VALUE_SCALE, OLED_TRIM_VALUE_TOP);
+    oled_flush();
 }
 
 static void format_elapsed_time(uint32_t elapsedMs, char text[6])
@@ -304,13 +361,20 @@ static void oled_service(const BallRodTelemetry *telemetry)
         return;
     }
 
+    if (telemetry->adjustmentUiActive) {
+        oled_write_adjustment(
+            telemetry->trimDirection, telemetry->currentSteps);
+        return;
+    }
+
     format_elapsed_time(telemetry->runElapsedMs, text);
     oled_write_text(text);
 }
 
 static bool state_is_active(BallRodState state)
 {
-    return ((state >= BALL_ROD_WAKE) && (state <= BALL_ROD_SETTLE)) ||
+    return (state == BALL_ROD_TRIM) ||
+        ((state >= BALL_ROD_WAKE) && (state <= BALL_ROD_SETTLE)) ||
         (state == BALL_ROD_TIMEOUT_LEVEL);
 }
 
@@ -358,7 +422,7 @@ int main(void)
      * STEP and scheduler interrupts.
      */
     oled_init();
-    oled_write_text("0.0s");
+    oled_write_adjustment(1, 0);
 
     NVIC_ClearPendingIRQ(PWM_BALL_STEP_INST_INT_IRQN);
     NVIC_ClearPendingIRQ(TIMER_0_INST_INT_IRQN);
