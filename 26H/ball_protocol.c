@@ -6,8 +6,8 @@
 #define BALL_FRAME_SIZE    (15U)
 #define BALL_PAYLOAD_SIZE  (8U)
 #define BALL_STATUS_TYPE          (0x83U)
-#define BALL_STATUS_PAYLOAD_SIZE  (36U)
-#define BALL_STATUS_FRAME_SIZE    (43U)
+#define BALL_STATUS_PAYLOAD_SIZE  (45U)
+#define BALL_STATUS_FRAME_SIZE    (52U)
 #define BALL_TX_QUEUE_SIZE        (4U)
 #define BALL_TX_PERIODIC_LIMIT    (3U)
 
@@ -328,9 +328,14 @@ bool ball_protocol_queue_status(const BallStatusFrame *status)
     put_u16_le(&frame[35], status->rxOverflows);
     put_u16_le(&frame[37], gTxDrops);
     frame[39] = status->event;
-    frame[40] = 0U;
-    crc = crc16_ccitt_false(&frame[2], 39U);
-    put_u16_le(&frame[41], crc);
+    frame[40] = status->faultReason;
+    put_u16_le(&frame[41], status->targetXQ4);
+    put_u16_le(&frame[43], (uint16_t) status->continuousTiltQ8);
+    put_u16_le(&frame[45], (uint16_t) status->frictionBoostQ8);
+    put_u16_le(&frame[47], status->visionAgeMs);
+    frame[49] = 0U;
+    crc = crc16_ccitt_false(&frame[2], 48U);
+    put_u16_le(&frame[50], crc);
 
     primask = __get_PRIMASK();
     __disable_irq();

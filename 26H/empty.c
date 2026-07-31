@@ -588,7 +588,8 @@ static void ball_oled_service(void)
         oled_write_text("Err");
         return;
     }
-    if (telemetry.state == BALL_ROD_ACTIVE) {
+    if ((telemetry.state == BALL_ROD_ACTIVE) ||
+        (telemetry.state == BALL_ROD_HOLD)) {
         append_u32(text, (uint16_t) telemetry.ballX);
         oled_write_text(text);
         return;
@@ -600,7 +601,7 @@ static void ball_led_service(BallRodState state)
 {
     uint32_t toggleMs;
 
-    if (state == BALL_ROD_ACTIVE) {
+    if ((state == BALL_ROD_ACTIVE) || (state == BALL_ROD_HOLD)) {
         DL_GPIO_setPins(LED_PORT, LED_led_PIN);
         return;
     }
@@ -676,6 +677,13 @@ static void __attribute__((unused)) ball_static_tick_5ms(void)
         status.tiltLimit = telemetry.tiltLimit;
         status.recoveryPhase = telemetry.recoveryPhase;
         status.armFrames = telemetry.armFrames;
+        status.targetXQ4 = telemetry.targetXQ4;
+        status.continuousTiltQ8 = telemetry.continuousTiltQ8;
+        status.frictionBoostQ8 = telemetry.frictionBoostQ8;
+        status.visionAgeMs =
+            (telemetry.visionAgeMs > 65535U) ? 65535U :
+            (uint16_t) telemetry.visionAgeMs;
+        status.faultReason = telemetry.faultReason;
         status.crcErrors = (uint16_t) telemetry.crcErrors;
         status.sequenceDrops =
             (uint16_t) telemetry.sequenceDrops;

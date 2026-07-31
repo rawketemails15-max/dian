@@ -85,97 +85,66 @@
 #define APP_OPERATION_MODE                     APP_OPERATION_MODE_BALL_STATIC
 
 /*
- * First installation must remain in calibration mode.  Remove the ball and
- * manually level the rod before power-on.  Record the safe travel displayed
- * on the OLED, subtract 16 steps at each end, update MIN/MAX and DIR_INVERT,
- * then set APP_BALL_CALIBRATION_MODE to 0 and rebuild.
+ * Ball rod installation.
+ *
+ * The rod has no angle sensor, encoder or limit switch.  Level it by hand
+ * before every power-up; software then calls that pose zero.  The +/-238
+ * limits are unconditional actuator limits, independent of controller state.
  */
-#define APP_BALL_CALIBRATION_MODE              (0U)
-#define APP_BALL_MIN_STEPS                     (-238)
-#define APP_BALL_MAX_STEPS                     (238)
+#define APP_BALL_CALIBRATION_MODE               (0U)
+#define APP_BALL_MIN_STEPS                      (-238)
+#define APP_BALL_MAX_STEPS                      (238)
 #define APP_BALL_DIR_INVERT                     (0U)
-#define APP_BALL_CALIBRATION_HARD_LIMIT         (256)
+#define APP_BALL_POSITION_TO_TILT_SIGN          (1)
+#define APP_BALL_NEUTRAL_STEPS                  (0.0f)
+#define APP_BALL_WORK_TILT_LIMIT_STEPS          (64)
 #define APP_BALL_CALIBRATION_JOG_STEPS          (16)
-#define APP_BALL_BUTTON_LONG_MS                 (600U)
 #define APP_BALL_BUTTON_ESTOP_MS                (2000U)
 
-#define APP_BALL_IMAGE_CENTER_X                 (160)
-#define APP_BALL_IMAGE_CENTER_Q4                (2560)
-#define APP_BALL_CENTER_DEADBAND_PX             (5)
-#define APP_BALL_CENTER_RELEASE_PX              (8)
-#define APP_BALL_CENTER_SETTLE_SPEED_PX_S       (5)
-#define APP_BALL_CENTER_RELEASE_SPEED_PX_S      (12)
-#define APP_BALL_CENTER_SETTLE_ERROR_Q4         (40)
-#define APP_BALL_CENTER_MUST_CORRECT_Q4         (61)
-#define APP_BALL_CENTER_STABLE_REAL_FRAMES      (15U)
-#define APP_BALL_CENTER_ARM_REAL_FRAMES         (5U)
-#define APP_BALL_CENTER_NO_PROGRESS_FRAMES      (3U)
-#define APP_BALL_CENTER_PROGRESS_Q4             (3U)
-#define APP_BALL_CENTER_VELOCITY_FILTER_DIVISOR (4)
-#define APP_BALL_CENTER_STUCK_REAL_FRAMES       (5U)
-#define APP_BALL_CENTER_INTEGRAL_DIVISOR        (64)
-#define APP_BALL_CENTER_INTEGRAL_LIMIT          (2560)
-#define APP_BALL_CENTER_INTEGRAL_DECAY_DIVISOR  (4)
-#define APP_BALL_CENTER_FINE_ZONE_Q4            (480U)
-#define APP_BALL_CENTER_INITIAL_TILT_STEPS      (48U)
-#define APP_BALL_CENTER_FINE_TILT_STEPS         (24U)
-#define APP_BALL_CENTER_MAX_TILT_STEPS          (120U)
-#define APP_BALL_CENTER_TILT_INCREMENT_STEPS    (12U)
-#define APP_BALL_CENTER_NUDGE_STEPS             (4)
-#define APP_BALL_CENTER_CROSS_TILT_STEPS        (8)
-#define APP_BALL_CENTER_BIAS_DECAY_STEPS        (2)
-#define APP_BALL_CENTER_RECOVERY_BACKOFF_STEPS  (12)
-#define APP_BALL_CENTER_FORCED_ACTION_MS        (500U)
-#define APP_BALL_CENTER_RECOVERY_INTERVAL_MS    (500U)
-#define APP_BALL_CENTER_LEVEL_HZ                (220U)
-#define APP_BALL_CENTER_CROSS_HZ                (160U)
-#define APP_BALL_VALID_FRAMES_TO_ARM            (5U)
-#define APP_BALL_VISION_RETURN_MS               (150U)
-#define APP_BALL_VISION_FAULT_MS                (1000U)
+/* Default fixed red-line target: x=160 px in Q4 pixels. */
+#define APP_BALL_DEFAULT_TARGET_X_Q4            (2560U)
+#define APP_BALL_VALID_FRAMES_TO_ARM            (3U)
+#define APP_BALL_VISION_STALE_MS                (150U)
 #define APP_BALL_STATUS_PERIOD_MS               (50U)
 
 /*
- * Static-car requirement-2 trajectory.  The 25 cm rod spans the 320-pixel
- * calibrated image axis, so 5 cm is 64 pixels.  The positive turnaround uses
- * a 12-pixel band; the final -5 cm hold uses the requested tighter +/-6-pixel
- * band.  Image X increases rightward and defines the positive direction.
+ * Position PD.  Output is a continuous relative rod angle in microsteps.
+ * Ki is intentionally zero because there is no measured rod-angle inner loop.
+ * These are conservative bench defaults and are the main real-car tuning
+ * surface: first KP, then KD.
  */
-#define APP_BALL_POSITIVE_5CM_X                 (224)
-#define APP_BALL_NEGATIVE_5CM_X                 (96)
-#define APP_BALL_POSITIVE_TOLERANCE_PX          (12)
-#define APP_BALL_FINAL_TOLERANCE_PX             (6)
-#define APP_BALL_SEQUENCE_TIMEOUT_MS            (5000U)
-#define APP_BALL_REVERSAL_LEVEL_MS              (150U)
-#define APP_BALL_LEVEL_SLEW_STEPS_PER_TICK      (2)
+#define APP_BALL_POSITION_KP                    (0.50f)
+#define APP_BALL_POSITION_KD                    (0.040f)
+#define APP_BALL_VELOCITY_FILTER_HZ             (3.0f)
+#define APP_BALL_OUTER_DT_MIN_MS                (15U)
+#define APP_BALL_OUTER_DT_MAX_MS                (100U)
+#define APP_BALL_TARGET_SLEW_STEPS_PER_FRAME    (8.0f)
+#define APP_BALL_LEVEL_SLEW_STEPS_PER_FRAME     (4.0f)
+
+/* Hold-zone hysteresis prevents STEP chatter at the red line. */
+#define APP_BALL_HOLD_ENTER_ERROR_Q4            (96)
+#define APP_BALL_HOLD_RELEASE_ERROR_Q4          (160)
+#define APP_BALL_HOLD_ENTER_SPEED_PX_S          (6.0f)
+#define APP_BALL_HOLD_RELEASE_SPEED_PX_S        (14.0f)
 
 /*
- * li-style cascade controller.
- * Outer position PD -> target rod angle (relative microsteps).
- * Inner step-position loop -> STEP frequency and direction.
- * KI remains zero as in the li ball-and-beam position loop.
+ * Rough-tube static-friction compensation.  Positive and negative breakaway
+ * values are deliberately independent because the tube is not uniform.
  */
-#define APP_BALL_POSITION_KP_NUMERATOR          (1)
-#define APP_BALL_POSITION_KP_DIVISOR            (2)
-#define APP_BALL_POSITION_KD_NUMERATOR          (1)
-#define APP_BALL_POSITION_KD_DIVISOR            (25)
-#define APP_BALL_D_FILTER_DIVISOR                (4)
-#define APP_BALL_OUTER_DT_MIN_MS                 (10U)
-#define APP_BALL_OUTER_DT_MAX_MS                 (100U)
-#define APP_BALL_ANGLE_TARGET_LIMIT_STEPS       (60)
-#define APP_BALL_TARGET_SLEW_STEPS_PER_FRAME    (6)
-#define APP_BALL_MIN_EFFECTIVE_TILT_STEPS       (8)
-#define APP_BALL_SPEED_NEAR_ERROR_PX            (15)
-#define APP_BALL_SPEED_MEDIUM_ERROR_PX          (40)
-#define APP_BALL_SPEED_NEAR_HZ                  (80U)
-#define APP_BALL_SPEED_MEDIUM_HZ                (160U)
-#define APP_BALL_SPEED_FAR_HZ                   (260U)
+#define APP_BALL_BREAKAWAY_STEPS_POS            (64.0f)
+#define APP_BALL_BREAKAWAY_STEPS_NEG            (64.0f)
+#define APP_BALL_STUCK_SPEED_PX_S               (4.0f)
+#define APP_BALL_STUCK_REAL_FRAMES              (6U)
+#define APP_BALL_FRICTION_INCREMENT_STEPS       (4.0f)
+#define APP_BALL_FRICTION_MAX_STEPS             (32.0f)
+#define APP_BALL_FRICTION_DECAY_STEPS           (4.0f)
 
+/* D36A STEP generator: arbitrary finite pulse packets with frequency ramp. */
 #define APP_BALL_STEP_CLOCK_HZ                  (4000000U)
 #define APP_BALL_STEP_MIN_HZ                    (80U)
 #define APP_BALL_STEP_MAX_HZ                    (300U)
-#define APP_BALL_STEP_HZ_PER_ERROR              (5U)
-#define APP_BALL_STEP_HZ_SLEW_PER_TICK          (3U)
-#define APP_BALL_POSITION_TOLERANCE_STEPS       (2)
+#define APP_BALL_STEP_HZ_PER_ERROR              (8U)
+#define APP_BALL_STEP_HZ_SLEW_PER_TICK          (10U)
 #define APP_D36A_WAKE_DELAY_MS                  (1U)
 
 #define APP_BALL_LED_WAIT_TOGGLE_MS             (500U)

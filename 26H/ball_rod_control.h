@@ -7,30 +7,33 @@
 #include <stdint.h>
 
 typedef enum {
-    BALL_ROD_CALIBRATION = 0,
+    BALL_ROD_DISARMED = 0,
     BALL_ROD_WAITING_VISION,
     BALL_ROD_ACTIVE,
-    BALL_ROD_RETURNING,
+    BALL_ROD_HOLD,
     BALL_ROD_VISION_FAULT,
     BALL_ROD_SAFETY_FAULT
 } BallRodState;
 
 typedef enum {
     BALL_MOTION_IDLE = 0,
-    BALL_MOTION_HOLD_CENTER,
-    BALL_MOTION_CENTER_BEFORE_SEQUENCE,
-    BALL_MOTION_TO_POSITIVE_5CM,
-    BALL_MOTION_RETURN_TO_LEVEL,
-    BALL_MOTION_TO_NEGATIVE_5CM,
-    BALL_MOTION_HOLD_NEGATIVE_5CM
+    BALL_MOTION_CORRECTING,
+    BALL_MOTION_HOLD_RED_LINE,
+    BALL_MOTION_LEVELING,
+    BALL_MOTION_CALIBRATION
 } BallMotionPhase;
 
 typedef enum {
-    BALL_CENTER_RECOVERY_NONE = 0,
-    BALL_CENTER_RECOVERY_BACKOFF,
-    BALL_CENTER_RECOVERY_REAPPLY,
-    BALL_CENTER_RECOVERY_LEVELING
-} BallCenterRecoveryPhase;
+    BALL_RECOVERY_NONE = 0,
+    BALL_RECOVERY_STATIC_FRICTION
+} BallRecoveryPhase;
+
+typedef enum {
+    BALL_FAULT_NONE = 0,
+    BALL_FAULT_VISION_STALE,
+    BALL_FAULT_HARD_LIMIT,
+    BALL_FAULT_EMERGENCY_STOP
+} BallFaultReason;
 
 typedef struct {
     BallRodState state;
@@ -41,6 +44,12 @@ typedef struct {
     int32_t maximumReached;
     int16_t ballX;
     int16_t ballError;
+    uint16_t targetXQ4;
+    int16_t ballErrorQ4;
+    int16_t filteredVelocity;
+    int16_t continuousTiltQ8;
+    int16_t frictionBoostQ8;
+    uint32_t visionAgeMs;
     uint16_t stepFrequencyHz;
     uint8_t directionLevel;
     bool stepRunning;
@@ -52,20 +61,20 @@ typedef struct {
     bool approachingCenter;
     bool recoveryActive;
     bool limitReached;
-    int16_t ballErrorQ4;
-    int16_t filteredVelocity;
     uint16_t runId;
     uint16_t tiltLimit;
     uint16_t eventCounter;
     uint8_t recoveryPhase;
     uint8_t armFrames;
     uint8_t event;
+    uint8_t faultReason;
     uint32_t crcErrors;
     uint32_t sequenceDrops;
     uint32_t rxOverflows;
 } BallRodTelemetry;
 
 void ball_rod_init(uint32_t nowMs);
+void ball_rod_set_target_x_q4(uint16_t targetXQ4);
 void ball_rod_tick_5ms(
     uint32_t nowMs, bool buttonPressed, const BallVisionSample *vision);
 void ball_rod_step_isr(void);

@@ -57,6 +57,11 @@ typedef struct {
     uint16_t tiltLimit;
     uint8_t recoveryPhase;
     uint8_t armFrames;
+    uint16_t targetXQ4;
+    int16_t continuousTiltQ8;
+    int16_t frictionBoostQ8;
+    uint16_t visionAgeMs;
+    uint8_t faultReason;
     uint16_t crcErrors;
     uint16_t sequenceDrops;
     uint16_t rxOverflows;
