@@ -34,7 +34,7 @@ from media.media import *
 import nncase_runtime as nn
 import ulab.numpy as np
 import image
-from machine import FPIOA, UART
+from machine import FPIOA, TOUCH, UART
 
 
 # 媒体管线在AP就绪后立即运行；RTSP等电脑或手机接入热点后再启用。
@@ -53,7 +53,7 @@ BOOT_SETTLE_MS = 3000
 AP_CLIENT_POLL_MS = 250
 AP_CLIENT_SETTLE_MS = 500
 AP_STATUS_FALLBACK_SETTLE_MS = 8000
-SCRIPT_VERSION = "steel-ball-full-v3-uart-center-low-latency-v3-safe"
+SCRIPT_VERSION = "steel-ball-full-v3-touch-target-uart-ack-v1"
 BOOT_LOG_PATH = "/sdcard/wifi_rtsp.log"
 BOOT_LOG_MAX_BYTES = 32768
 
@@ -166,7 +166,24 @@ UART_BAUD_RATE = 115200
 UART_SEND_INTERVAL_MS = 33
 UART_PROTOCOL_VERSION = 0x01
 UART_MESSAGE_BALL_X = 0x03
-UART_BALL_CENTER_X = 160
+UART_MESSAGE_TARGET_X = 0x04
+UART_MESSAGE_STATUS = 0x83
+UART_STATUS_PAYLOAD_SIZE = 45
+UART_STATUS_FRAME_SIZE = 52
+UART_TARGET_SEND_INTERVAL_MS = 33
+UART_TARGET_RETRY_MS = 100
+UART_TARGET_HEARTBEAT_MS = 500
+UART_STATUS_STALE_MS = 300
+
+BALL_TARGET_DEFAULT_X = 171
+BALL_TARGET_DEFAULT_X_Q4 = BALL_TARGET_DEFAULT_X * 16
+BALL_TARGET_MIN_X_Q4 = 0
+BALL_TARGET_MAX_X_Q4 = 319 * 16
+
+TOUCH_LINE_HIT_HALF_WIDTH = 30
+TOUCH_RELEASE_EMPTY_FRAMES = 2
+TOUCH_TARGET_DEADBAND_Q4 = 8
+TOUCH_RETRY_MS = 1000
 
 # Keep this False until the servos use an external regulated 5 V supply and
 # the external supply GND is connected to K230 GND. Set True after wiring.
@@ -474,18 +491,251 @@ class UdpBallSender:
         self.sock = None
 
 
+def clamp_integer(value, minimum, maximum):
+    if value < minimum:
+        return minimum
+    if value > maximum:
+        return maximum
+    return value
+
+
+def display_x_to_target_q4(display_x):
+    display_x = clamp_integer(
+        int(display_x),
+        0,
+        DISPLAY_WIDTH - 1
+    )
+    target_q4 = (
+        display_x * AI_FRAME_SIZE[0] * 16
+        + DISPLAY_WIDTH // 2
+    ) // DISPLAY_WIDTH
+    return clamp_integer(
+        target_q4,
+        BALL_TARGET_MIN_X_Q4,
+        BALL_TARGET_MAX_X_Q4
+    )
+
+
+def target_q4_to_display_x(target_q4):
+    target_q4 = clamp_integer(
+        int(target_q4),
+        BALL_TARGET_MIN_X_Q4,
+        BALL_TARGET_MAX_X_Q4
+    )
+    display_x = (
+        target_q4 * DISPLAY_WIDTH
+        + AI_FRAME_SIZE[0] * 8
+    ) // (AI_FRAME_SIZE[0] * 16)
+    return clamp_integer(
+        display_x,
+        0,
+        DISPLAY_WIDTH - 1
+    )
+
+
+def crc16_ccitt_false(data, start, length):
+    crc = 0xFFFF
+
+    for index in range(start, start + length):
+        crc ^= data[index] << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+def build_target_frame(sequence, target_x_q4):
+    target_x_q4 = clamp_integer(
+        int(target_x_q4),
+        BALL_TARGET_MIN_X_Q4,
+        BALL_TARGET_MAX_X_Q4
+    )
+    frame = bytearray(11)
+    frame[0] = 0xA5
+    frame[1] = 0x5A
+    frame[2] = UART_PROTOCOL_VERSION
+    frame[3] = UART_MESSAGE_TARGET_X
+    frame[4] = 4
+    frame[5] = sequence & 0xFF
+    frame[6] = (sequence >> 8) & 0xFF
+    frame[7] = target_x_q4 & 0xFF
+    frame[8] = (target_x_q4 >> 8) & 0xFF
+    crc = crc16_ccitt_false(frame, 2, 7)
+    frame[9] = crc & 0xFF
+    frame[10] = (crc >> 8) & 0xFF
+    return frame
+
+
+class DraggableTargetLine:
+    """Capture one touch gesture and map LCD X to the 320-pixel target."""
+
+    STATE_IDLE = 0
+    STATE_DRAGGING = 1
+    STATE_IGNORED = 2
+
+    def __init__(self, target_x_q4=BALL_TARGET_DEFAULT_X_Q4):
+        self.target_x_q4 = clamp_integer(
+            int(target_x_q4),
+            BALL_TARGET_MIN_X_Q4,
+            BALL_TARGET_MAX_X_Q4
+        )
+        self.state = self.STATE_IDLE
+        self.dragging = False
+        self.empty_frames = 0
+
+    def display_x(self):
+        return target_q4_to_display_x(self.target_x_q4)
+
+    def update(self, points):
+        changed = False
+        committed = False
+        touching = bool(points)
+
+        if touching:
+            touch_x = clamp_integer(
+                int(points[0].x),
+                0,
+                DISPLAY_WIDTH - 1
+            )
+            self.empty_frames = 0
+
+            if self.state == self.STATE_IDLE:
+                if (
+                    abs(touch_x - self.display_x())
+                    <= TOUCH_LINE_HIT_HALF_WIDTH
+                ):
+                    self.state = self.STATE_DRAGGING
+                    self.dragging = True
+                else:
+                    self.state = self.STATE_IGNORED
+                    self.dragging = False
+
+            if self.state == self.STATE_DRAGGING:
+                new_target_q4 = display_x_to_target_q4(
+                    touch_x
+                )
+                if (
+                    abs(new_target_q4 - self.target_x_q4)
+                    >= TOUCH_TARGET_DEADBAND_Q4
+                ):
+                    self.target_x_q4 = new_target_q4
+                    changed = True
+            return changed, committed
+
+        if self.state != self.STATE_IDLE:
+            self.empty_frames += 1
+            if self.empty_frames >= TOUCH_RELEASE_EMPTY_FRAMES:
+                committed = self.state == self.STATE_DRAGGING
+                self.state = self.STATE_IDLE
+                self.dragging = False
+                self.empty_frames = 0
+        return changed, committed
+
+
+class MspStatusParser:
+    """Incrementally parse the existing 52-byte MSPM0 status frame."""
+
+    def __init__(self):
+        self.frame = bytearray(UART_STATUS_FRAME_SIZE)
+        self.index = 0
+        self.raw_bytes = 0
+        self.valid_frames = 0
+        self.crc_errors = 0
+        self.format_errors = 0
+        self.sequence = 0
+        self.target_x_q4 = None
+        self.last_status_ms = 0
+
+    def _resync(self, value=0):
+        if value == 0xA5:
+            self.frame[0] = value
+            self.index = 1
+        else:
+            self.index = 0
+
+    def feed(self, data, now_ms):
+        if not data:
+            return
+
+        for value in data:
+            self.raw_bytes += 1
+            if self.index == 0:
+                if value == 0xA5:
+                    self.frame[0] = value
+                    self.index = 1
+                continue
+            if self.index == 1:
+                if value == 0x5A:
+                    self.frame[1] = value
+                    self.index = 2
+                else:
+                    self._resync(value)
+                continue
+
+            self.frame[self.index] = value
+            self.index += 1
+            if self.index == 5:
+                if (
+                    self.frame[2] != UART_PROTOCOL_VERSION
+                    or self.frame[3] != UART_MESSAGE_STATUS
+                    or self.frame[4] != UART_STATUS_PAYLOAD_SIZE
+                ):
+                    self.format_errors += 1
+                    self._resync(value)
+                    continue
+
+            if self.index == UART_STATUS_FRAME_SIZE:
+                received_crc = (
+                    self.frame[50]
+                    | (self.frame[51] << 8)
+                )
+                calculated_crc = crc16_ccitt_false(
+                    self.frame,
+                    2,
+                    48
+                )
+                if received_crc == calculated_crc:
+                    self.sequence = (
+                        self.frame[5]
+                        | (self.frame[6] << 8)
+                    )
+                    self.target_x_q4 = (
+                        self.frame[41]
+                        | (self.frame[42] << 8)
+                    )
+                    self.last_status_ms = now_ms
+                    self.valid_frames += 1
+                else:
+                    self.crc_errors += 1
+                self._resync(value)
+
+
 class BallUartSender:
-    """Send the latest X coordinate as a fixed CRC-protected binary frame."""
+    """Bidirectional MSPM0 link for vision, target and status ACK frames."""
 
     def __init__(self):
         self.uart = None
-        self.sequence = 0
+        self.vision_sequence = 0
+        self.target_sequence = 0
         self.last_send_ms = time.ticks_add(
             time.ticks_ms(),
             -UART_SEND_INTERVAL_MS
         )
+        self.last_target_send_ms = time.ticks_add(
+            time.ticks_ms(),
+            -UART_TARGET_HEARTBEAT_MS
+        )
+        self.start_ms = time.ticks_ms()
+        self.requested_target_x_q4 = BALL_TARGET_DEFAULT_X_Q4
+        self.target_pending = True
+        self.target_force = True
+        self.status_parser = MspStatusParser()
         self.sent = 0
+        self.target_sent = 0
         self.failures = 0
+        self.rx_failures = 0
 
         try:
             fpioa = FPIOA()
@@ -506,6 +756,11 @@ class BallUartSender:
                 pd=0,
                 st=1
             )
+            try:
+                fpioa.help(UART_TX_IO)
+                fpioa.help(UART_RX_IO)
+            except Exception as error:
+                print("UART1 FPIOA状态读取失败:", error)
             self.uart = UART(
                 UART.UART1,
                 baudrate=UART_BAUD_RATE,
@@ -519,26 +774,19 @@ class BallUartSender:
             self.uart = None
             print("UART1坐标输出关闭:", error)
 
-    @staticmethod
-    def _crc16_ccitt_false(data, start, length):
-        crc = 0xFFFF
-
-        for index in range(start, start + length):
-            crc ^= data[index] << 8
-            for _ in range(8):
-                if crc & 0x8000:
-                    crc = ((crc << 1) ^ 0x1021) & 0xFFFF
-                else:
-                    crc = (crc << 1) & 0xFFFF
-        return crc
-
-    @staticmethod
-    def _clamp(value, minimum, maximum):
-        if value < minimum:
-            return minimum
-        if value > maximum:
-            return maximum
-        return value
+    def _write_frame(self, frame, is_target=False):
+        if self.uart is None:
+            return False
+        try:
+            self.uart.write(frame)
+            if is_target:
+                self.target_sent += 1
+            else:
+                self.sent += 1
+            return True
+        except Exception:
+            self.failures += 1
+            return False
 
     def send(self, motion):
         now_ms = time.ticks_ms()
@@ -558,17 +806,17 @@ class BallUartSender:
             flags = 0x01
             if motion[4] <= 0.0:
                 flags |= 0x02
-            confidence = self._clamp(
+            confidence = clamp_integer(
                 int(motion[4] * 255.0 + 0.5),
                 0,
                 255
             )
-            x_q4 = self._clamp(
+            x_q4 = clamp_integer(
                 int(motion[0] * 16.0 + 0.5),
                 0,
                 0xFFFF
             )
-            velocity_x = self._clamp(
+            velocity_x = clamp_integer(
                 int(motion[2]),
                 -32768,
                 32767
@@ -580,26 +828,126 @@ class BallUartSender:
         frame[2] = UART_PROTOCOL_VERSION
         frame[3] = UART_MESSAGE_BALL_X
         frame[4] = 8
-        frame[5] = self.sequence & 0xFF
-        frame[6] = (self.sequence >> 8) & 0xFF
+        frame[5] = self.vision_sequence & 0xFF
+        frame[6] = (self.vision_sequence >> 8) & 0xFF
         frame[7] = flags
         frame[8] = confidence
         frame[9] = x_q4 & 0xFF
         frame[10] = (x_q4 >> 8) & 0xFF
         frame[11] = velocity_x & 0xFF
         frame[12] = (velocity_x >> 8) & 0xFF
-        crc = self._crc16_ccitt_false(frame, 2, 11)
+        crc = crc16_ccitt_false(frame, 2, 11)
         frame[13] = crc & 0xFF
         frame[14] = (crc >> 8) & 0xFF
 
-        self.sequence = (self.sequence + 1) & 0xFFFF
+        self.vision_sequence = (
+            self.vision_sequence + 1
+        ) & 0xFFFF
+        self._write_frame(frame)
+
+    def set_target(self, target_x_q4, force=False):
+        target_x_q4 = clamp_integer(
+            int(target_x_q4),
+            BALL_TARGET_MIN_X_Q4,
+            BALL_TARGET_MAX_X_Q4
+        )
+        if target_x_q4 != self.requested_target_x_q4:
+            self.requested_target_x_q4 = target_x_q4
+            self.target_pending = True
+        if force:
+            self.target_pending = True
+            self.target_force = True
+
+    def request_target_resend(self):
+        self.target_pending = True
+        self.target_force = True
+
+    def _send_target_frame(self, now_ms):
+        frame = build_target_frame(
+            self.target_sequence,
+            self.requested_target_x_q4
+        )
+
+        self.target_sequence = (
+            self.target_sequence + 1
+        ) & 0xFFFF
+        self.last_target_send_ms = now_ms
+        self.target_pending = False
+        self.target_force = False
+        self._write_frame(frame, is_target=True)
+
+    def target_acknowledged(self, now_ms=None):
+        if now_ms is None:
+            now_ms = time.ticks_ms()
+        parser = self.status_parser
+        if parser.last_status_ms == 0:
+            return False
+        if (
+            time.ticks_diff(now_ms, parser.last_status_ms)
+            > UART_STATUS_STALE_MS
+        ):
+            return False
+        return parser.target_x_q4 == self.requested_target_x_q4
+
+    def target_ack_text(self, now_ms=None):
+        if now_ms is None:
+            now_ms = time.ticks_ms()
+        parser = self.status_parser
+        if self.uart is None:
+            return "LINK LOST"
+        if parser.last_status_ms == 0:
+            if (
+                time.ticks_diff(now_ms, self.start_ms)
+                > UART_STATUS_STALE_MS
+            ):
+                return "LINK LOST"
+            return "WAIT"
+        if (
+            time.ticks_diff(now_ms, parser.last_status_ms)
+            > UART_STATUS_STALE_MS
+        ):
+            return "LINK LOST"
+        if parser.target_x_q4 == self.requested_target_x_q4:
+            return "ACK"
+        return "WAIT"
+
+    def service_target(self, force=False):
+        now_ms = time.ticks_ms()
+        if force:
+            self.target_pending = True
+            self.target_force = True
+
+        elapsed_ms = time.ticks_diff(
+            now_ms,
+            self.last_target_send_ms
+        )
+        should_send = self.target_force
+        if (
+            not should_send
+            and self.target_pending
+            and elapsed_ms >= UART_TARGET_SEND_INTERVAL_MS
+        ):
+            should_send = True
+        if not should_send and not self.target_acknowledged(now_ms):
+            should_send = elapsed_ms >= UART_TARGET_RETRY_MS
+        if not should_send and self.target_acknowledged(now_ms):
+            should_send = elapsed_ms >= UART_TARGET_HEARTBEAT_MS
+
+        if should_send:
+            self._send_target_frame(now_ms)
+
+    def poll_status(self):
         if self.uart is None:
             return
         try:
-            self.uart.write(frame)
-            self.sent += 1
+            data = self.uart.read()
+            if data:
+                self.status_parser.feed(
+                    data,
+                    time.ticks_ms()
+                )
         except Exception:
-            self.failures += 1
+            self.rx_failures += 1
 
     def close(self):
         if self.uart is not None:
@@ -2036,7 +2384,13 @@ class CombinedMediaPipeline:
 # LCD识别标记
 # ============================================================
 
-def draw_marker(pipeline, motion, uart_sender=None):
+def draw_marker(
+    pipeline,
+    motion,
+    uart_sender=None,
+    target_line=None,
+    force=False
+):
     global last_marker_update_ms
     global display_marker_enabled
     global display_marker_error_reported
@@ -2055,7 +2409,8 @@ def draw_marker(pipeline, motion, uart_sender=None):
 
     now_ms = time.ticks_ms()
     if (
-        last_marker_update_ms
+        not force
+        and last_marker_update_ms
         and time.ticks_diff(
             now_ms,
             last_marker_update_ms
@@ -2066,18 +2421,27 @@ def draw_marker(pipeline, motion, uart_sender=None):
     last_marker_update_ms = now_ms
 
     pipeline.osd_img.clear()
-    display_center_x = (
-        UART_BALL_CENTER_X
-        * DISPLAY_WIDTH
-        // AI_FRAME_SIZE[0]
-    )
+    if target_line is None:
+        target_x_q4 = BALL_TARGET_DEFAULT_X_Q4
+        display_center_x = target_q4_to_display_x(
+            target_x_q4
+        )
+        line_thickness = 4
+        dragging = False
+    else:
+        target_x_q4 = target_line.target_x_q4
+        display_center_x = target_line.display_x()
+        line_thickness = 6 if target_line.dragging else 4
+        dragging = target_line.dragging
+    target_x = target_x_q4 / 16.0
+
     pipeline.osd_img.draw_line(
         display_center_x,
         0,
         display_center_x,
         DISPLAY_HEIGHT - 1,
         color=CENTER_LINE_COLOR,
-        thickness=2
+        thickness=line_thickness
     )
 
     if motion is not None:
@@ -2122,11 +2486,13 @@ def draw_marker(pipeline, motion, uart_sender=None):
             8,
             8,
             22,
-            "X:%.1f ERR:%+.1f%s"
+            "X:%.1f T:%.1f ERR:%+.1f%s%s"
             % (
                 motion[0],
-                motion[0] - UART_BALL_CENTER_X,
-                " PRED" if motion[4] <= 0.0 else ""
+                target_x,
+                target_x - motion[0],
+                " PRED" if motion[4] <= 0.0 else "",
+                " DRAG" if dragging else ""
             ),
             color=OSD_TEXT_COLOR
         )
@@ -2135,16 +2501,23 @@ def draw_marker(pipeline, motion, uart_sender=None):
             8,
             8,
             22,
-            "BALL LOST",
+            "BALL LOST T:%.1f%s"
+            % (
+                target_x,
+                " DRAG" if dragging else ""
+            ),
             color=OSD_TEXT_COLOR
         )
 
     if uart_sender is None or uart_sender.uart is None:
-        uart_text = "UART:OFF"
+        uart_text = "UART:OFF LINK LOST"
     else:
-        uart_text = "TX:%d E:%d" % (
+        uart_text = "VTX:%d TTX:%d %s E:%d/%d" % (
             uart_sender.sent,
-            uart_sender.failures
+            uart_sender.target_sent,
+            uart_sender.target_ack_text(now_ms),
+            uart_sender.failures,
+            uart_sender.status_parser.crc_errors
         )
     pipeline.osd_img.draw_string_advanced(
         8,
@@ -2270,6 +2643,12 @@ def main():
     udp = None
     uart_sender = None
     servo = None
+    touch = None
+    target_line = DraggableTargetLine()
+    last_touch_init_ms = time.ticks_add(
+        time.ticks_ms(),
+        -TOUCH_RETRY_MS
+    )
     restart_count = 0
 
     try:
@@ -2293,6 +2672,10 @@ def main():
         ap, ap_ip = start_ap()
         udp = UdpBallSender(ap_ip)
         uart_sender = BallUartSender()
+        uart_sender.set_target(
+            target_line.target_x_q4,
+            force=True
+        )
         servo = BallServoController()
         log_event(
             "AP已就绪，立即启动LCD、识别、UART与RTSP；"
@@ -2344,6 +2727,18 @@ def main():
                 )
                 pipeline.start()
                 pipeline.poll_rtsp_client(ap)
+                if touch is None:
+                    last_touch_init_ms = time.ticks_ms()
+                    try:
+                        touch = TOUCH(0)
+                        print(
+                            "TOUCH(0) ready: drag red line "
+                            "within +/-30 LCD pixels"
+                        )
+                    except Exception as error:
+                        touch = None
+                        print("触摸目标线关闭:", error)
+                uart_sender.request_target_resend()
                 display_marker_enabled = True
                 display_marker_error_reported = False
                 display_marker_last_error_ms = 0
@@ -2379,11 +2774,50 @@ def main():
 
                     input_np = pipeline.get_frame()
                     motion = tracker.run(input_np)
+                    points = ()
+                    if (
+                        touch is None
+                        and time.ticks_diff(
+                            time.ticks_ms(),
+                            last_touch_init_ms
+                        ) >= TOUCH_RETRY_MS
+                    ):
+                        last_touch_init_ms = time.ticks_ms()
+                        try:
+                            touch = TOUCH(0)
+                            print("TOUCH(0)重新初始化成功")
+                        except Exception:
+                            touch = None
+                    if touch is not None:
+                        try:
+                            points = touch.read(1)
+                        except Exception as error:
+                            print("触摸读取失败，1秒后重试:", error)
+                            touch = None
+                            last_touch_init_ms = time.ticks_ms()
+                    target_changed, target_committed = (
+                        target_line.update(points)
+                    )
+                    if target_changed:
+                        uart_sender.set_target(
+                            target_line.target_x_q4
+                        )
+                    if target_committed:
+                        uart_sender.set_target(
+                            target_line.target_x_q4,
+                            force=True
+                        )
+                    uart_sender.poll_status()
+                    uart_sender.service_target(
+                        force=target_committed
+                    )
                     uart_sender.send(motion)
                     draw_marker(
                         pipeline,
                         motion,
-                        uart_sender
+                        uart_sender,
+                        target_line,
+                        force=target_changed or target_committed
                     )
                     udp.send(motion)
                     servo_angles = servo.update(motion)
@@ -2445,6 +2879,19 @@ def main():
                                     udp.sent
                                 )
                             )
+                        print(
+                            "[TARGET] x=%.1f %s "
+                            "target_tx=%d status_rx=%d "
+                            "crc=%d format=%d"
+                            % (
+                                target_line.target_x_q4 / 16.0,
+                                uart_sender.target_ack_text(now),
+                                uart_sender.target_sent,
+                                uart_sender.status_parser.valid_frames,
+                                uart_sender.status_parser.crc_errors,
+                                uart_sender.status_parser.format_errors
+                            )
+                        )
                         frame_count = 0
                         detected_count = 0
                         last_motion = None

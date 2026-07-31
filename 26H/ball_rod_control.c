@@ -502,7 +502,19 @@ void ball_rod_init(uint32_t nowMs)
 
 void ball_rod_set_target_x_q4(uint16_t targetXQ4)
 {
+    if (targetXQ4 > APP_BALL_TARGET_MAX_X_Q4) {
+        targetXQ4 = APP_BALL_TARGET_MAX_X_Q4;
+    }
+    if (targetXQ4 == gTargetXQ4) {
+        return;
+    }
     gTargetXQ4 = targetXQ4;
+    gTelemetry.targetXQ4 = gTargetXQ4;
+    if (gTelemetry.state == BALL_ROD_HOLD) {
+        gTelemetry.state = BALL_ROD_ACTIVE;
+        gTelemetry.motionPhase = BALL_MOTION_CORRECTING;
+        publish_event(BALL_STATUS_EVENT_CORRECTION_RESUME);
+    }
     gHoldLatched = false;
     gFrictionBoost = 0.0f;
     gTiltResidual = 0.0f;

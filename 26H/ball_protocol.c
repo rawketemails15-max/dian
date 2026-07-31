@@ -2,9 +2,14 @@
 
 #include "ti_msp_dl_config.h"
 
-#define BALL_RX_RING_SIZE  (128U)
-#define BALL_FRAME_SIZE    (15U)
-#define BALL_PAYLOAD_SIZE  (8U)
+#define BALL_RX_RING_SIZE          (128U)
+#define BALL_RX_FRAME_MAX_SIZE     (15U)
+#define BALL_FRAME_OVERHEAD_SIZE   (7U)
+#define BALL_PROTOCOL_VERSION      (0x01U)
+#define BALL_VISION_TYPE           (0x03U)
+#define BALL_TARGET_TYPE           (0x04U)
+#define BALL_VISION_PAYLOAD_SIZE   (8U)
+#define BALL_TARGET_PAYLOAD_SIZE   (4U)
 #define BALL_STATUS_TYPE          (0x83U)
 #define BALL_STATUS_PAYLOAD_SIZE  (45U)
 #define BALL_STATUS_FRAME_SIZE    (52U)
@@ -21,10 +26,13 @@ static volatile uint8_t gRxWrite;
 static volatile uint8_t gRxRead;
 static volatile uint32_t gRxOverflows;
 
-static uint8_t gFrame[BALL_FRAME_SIZE];
+static uint8_t gFrame[BALL_RX_FRAME_MAX_SIZE];
 static uint8_t gFrameIndex;
+static uint8_t gExpectedFrameSize;
 static BallVisionSample gSample;
-static bool gHaveSequence;
+static BallTargetCommand gTargetCommand;
+static bool gHaveVisionSequence;
+static bool gHaveTargetSequence;
 static BallTxFrame gTxQueue[BALL_TX_QUEUE_SIZE];
 static volatile uint8_t gTxRead;
 static volatile uint8_t gTxWrite;
@@ -167,26 +175,18 @@ static bool remove_newest_queued_periodic(void)
     return false;
 }
 
-static void accept_frame(uint32_t nowMs)
+static void accept_vision_frame(uint32_t nowMs)
 {
-    uint16_t receivedCrc =
-        (uint16_t) gFrame[13] | ((uint16_t) gFrame[14] << 8U);
-    uint16_t calculatedCrc = crc16_ccitt_false(&gFrame[2], 11U);
     uint16_t sequence;
 
-    if (receivedCrc != calculatedCrc) {
-        gSample.crcErrors++;
-        return;
-    }
-
     sequence = (uint16_t) gFrame[5] | ((uint16_t) gFrame[6] << 8U);
-    if (gHaveSequence) {
+    if (gHaveVisionSequence) {
         uint16_t expected = (uint16_t) (gSample.sequence + 1U);
         if (sequence != expected) {
             gSample.sequenceDrops += (uint16_t) (sequence - expected);
         }
     }
-    gHaveSequence = true;
+    gHaveVisionSequence = true;
 
     gSample.received = true;
     gSample.sequence = sequence;
@@ -205,6 +205,53 @@ static void accept_frame(uint32_t nowMs)
         }
     } else {
         gSample.validStreak = 0U;
+    }
+}
+
+static void accept_target_frame(uint32_t nowMs)
+{
+    uint16_t sequence =
+        (uint16_t) gFrame[5] | ((uint16_t) gFrame[6] << 8U);
+
+    if (gHaveTargetSequence) {
+        uint16_t expected =
+            (uint16_t) (gTargetCommand.sequence + 1U);
+        if (sequence != expected) {
+            gTargetCommand.sequenceDrops +=
+                (uint16_t) (sequence - expected);
+        }
+    }
+    gHaveTargetSequence = true;
+    gTargetCommand.received = true;
+    gTargetCommand.sequence = sequence;
+    gTargetCommand.targetXQ4 =
+        (uint16_t) gFrame[7] | ((uint16_t) gFrame[8] << 8U);
+    gTargetCommand.lastCommandMs = nowMs;
+    gTargetCommand.updateCounter++;
+}
+
+static void accept_frame(uint32_t nowMs)
+{
+    uint8_t crcIndex = (uint8_t) (gExpectedFrameSize - 2U);
+    uint16_t receivedCrc =
+        (uint16_t) gFrame[crcIndex] |
+        ((uint16_t) gFrame[crcIndex + 1U] << 8U);
+    uint16_t calculatedCrc = crc16_ccitt_false(
+        &gFrame[2], (uint8_t) (gExpectedFrameSize - 4U));
+
+    if (receivedCrc != calculatedCrc) {
+        if (gFrame[3] == BALL_TARGET_TYPE) {
+            gTargetCommand.crcErrors++;
+        } else {
+            gSample.crcErrors++;
+        }
+        return;
+    }
+
+    if (gFrame[3] == BALL_TARGET_TYPE) {
+        accept_target_frame(nowMs);
+    } else {
+        accept_vision_frame(nowMs);
     }
 }
 
@@ -227,13 +274,31 @@ static void parse_byte(uint8_t value, uint32_t nowMs)
 
     gFrame[gFrameIndex++] = value;
     if (gFrameIndex == 5U) {
-        if ((gFrame[2] != 0x01U) || (gFrame[3] != 0x03U) ||
-            (gFrame[4] != BALL_PAYLOAD_SIZE)) {
+        if (gFrame[2] != BALL_PROTOCOL_VERSION) {
             gFrameIndex = (value == 0xA5U) ? 1U : 0U;
+            return;
         }
-    } else if (gFrameIndex == BALL_FRAME_SIZE) {
+        if ((gFrame[3] == BALL_VISION_TYPE) &&
+            (gFrame[4] == BALL_VISION_PAYLOAD_SIZE)) {
+            gExpectedFrameSize =
+                BALL_FRAME_OVERHEAD_SIZE + BALL_VISION_PAYLOAD_SIZE;
+        } else if ((gFrame[3] == BALL_TARGET_TYPE) &&
+            (gFrame[4] == BALL_TARGET_PAYLOAD_SIZE)) {
+            gExpectedFrameSize =
+                BALL_FRAME_OVERHEAD_SIZE + BALL_TARGET_PAYLOAD_SIZE;
+        } else {
+            if (gFrame[3] == BALL_TARGET_TYPE) {
+                gTargetCommand.formatErrors++;
+            }
+            gFrameIndex = (value == 0xA5U) ? 1U : 0U;
+            return;
+        }
+    }
+    if ((gExpectedFrameSize != 0U) &&
+        (gFrameIndex == gExpectedFrameSize)) {
         accept_frame(nowMs);
         gFrameIndex = 0U;
+        gExpectedFrameSize = 0U;
     }
 }
 
@@ -243,8 +308,11 @@ void ball_protocol_init(void)
     gRxRead = 0U;
     gRxOverflows = 0U;
     gFrameIndex = 0U;
-    gHaveSequence = false;
+    gExpectedFrameSize = 0U;
+    gHaveVisionSequence = false;
+    gHaveTargetSequence = false;
     gSample = (BallVisionSample) {0};
+    gTargetCommand = (BallTargetCommand) {0};
     gTxRead = 0U;
     gTxWrite = 0U;
     gTxCount = 0U;
@@ -282,6 +350,7 @@ void ball_protocol_process_5ms(uint32_t nowMs)
         parse_byte(value, nowMs);
     }
     gSample.rxOverflows = gRxOverflows;
+    gTargetCommand.rxOverflows = gRxOverflows;
 }
 
 BallVisionSample ball_protocol_get_sample(void)
@@ -295,6 +364,19 @@ BallVisionSample ball_protocol_get_sample(void)
         __enable_irq();
     }
     return sample;
+}
+
+BallTargetCommand ball_protocol_get_target_command(void)
+{
+    BallTargetCommand command;
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+    command = gTargetCommand;
+    if (primask == 0U) {
+        __enable_irq();
+    }
+    return command;
 }
 
 bool ball_protocol_queue_status(const BallStatusFrame *status)

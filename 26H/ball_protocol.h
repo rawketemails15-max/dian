@@ -20,6 +20,18 @@ typedef struct {
     uint32_t rxOverflows;
 } BallVisionSample;
 
+typedef struct {
+    bool received;
+    uint16_t sequence;
+    uint16_t targetXQ4;
+    uint32_t lastCommandMs;
+    uint32_t updateCounter;
+    uint32_t crcErrors;
+    uint32_t sequenceDrops;
+    uint32_t formatErrors;
+    uint32_t rxOverflows;
+} BallTargetCommand;
+
 typedef enum {
     BALL_STATUS_EVENT_NONE = 0,
     BALL_STATUS_EVENT_CENTER_START = 1,
@@ -72,6 +84,7 @@ void ball_protocol_init(void);
 void ball_protocol_uart_isr(void);
 void ball_protocol_process_5ms(uint32_t nowMs);
 BallVisionSample ball_protocol_get_sample(void);
+BallTargetCommand ball_protocol_get_target_command(void);
 bool ball_protocol_queue_status(const BallStatusFrame *status);
 uint16_t ball_protocol_get_tx_drops(void);
 

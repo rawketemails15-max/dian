@@ -101,8 +101,10 @@
 #define APP_BALL_CALIBRATION_JOG_STEPS          (16)
 #define APP_BALL_BUTTON_ESTOP_MS                (2000U)
 
-/* Default fixed red-line target: x=160 px in Q4 pixels. */
-#define APP_BALL_DEFAULT_TARGET_X_Q4            (2560U)
+/* Draggable red-line target: AI x=0..319 px, default x=171 px. */
+#define APP_BALL_TARGET_MIN_X_Q4                (0U)
+#define APP_BALL_TARGET_MAX_X_Q4                (5104U)
+#define APP_BALL_DEFAULT_TARGET_X_Q4            (2736U)
 #define APP_BALL_VALID_FRAMES_TO_ARM            (3U)
 #define APP_BALL_VISION_STALE_MS                (150U)
 #define APP_BALL_STATUS_PERIOD_MS               (50U)
@@ -133,9 +135,9 @@
  */
 #define APP_BALL_BREAKAWAY_STEPS_POS            (64.0f)
 #define APP_BALL_BREAKAWAY_STEPS_NEG            (64.0f)
-#define APP_BALL_STUCK_SPEED_PX_S               (4.0f)
-#define APP_BALL_STUCK_REAL_FRAMES              (6U)
-#define APP_BALL_FRICTION_INCREMENT_STEPS       (4.0f)
+#define APP_BALL_STUCK_SPEED_PX_S               (8.0f)
+#define APP_BALL_STUCK_REAL_FRAMES              (4U)
+#define APP_BALL_FRICTION_INCREMENT_STEPS       (16.0f)
 #define APP_BALL_FRICTION_MAX_STEPS             (32.0f)
 #define APP_BALL_FRICTION_DECAY_STEPS           (4.0f)
 

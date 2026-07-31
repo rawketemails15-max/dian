@@ -110,6 +110,7 @@ static uint32_t gButtonRawChangedMs;
 static uint32_t gBallLedLastToggleMs;
 static uint32_t gBallLastStatusMs;
 static uint16_t gBallLastEventCounter;
+static uint32_t gBallLastTargetUpdateCounter;
 
 static bool elapsed_ms(uint32_t startMs, uint32_t durationMs)
 {
@@ -617,6 +618,7 @@ static void ball_led_service(BallRodState state)
 static void __attribute__((unused)) ball_static_tick_5ms(void)
 {
     BallVisionSample vision;
+    BallTargetCommand targetCommand;
     BallRodTelemetry telemetry;
     BallStatusFrame status;
     uint16_t flags = 0U;
@@ -627,6 +629,14 @@ static void __attribute__((unused)) ball_static_tick_5ms(void)
         (APP_BUTTON_ACTIVE_LEVEL != 0U);
 
     ball_protocol_process_5ms(gMs);
+    targetCommand = ball_protocol_get_target_command();
+    if (targetCommand.received &&
+        (targetCommand.updateCounter !=
+            gBallLastTargetUpdateCounter)) {
+        gBallLastTargetUpdateCounter =
+            targetCommand.updateCounter;
+        ball_rod_set_target_x_q4(targetCommand.targetXQ4);
+    }
     vision = ball_protocol_get_sample();
     ball_rod_tick_5ms(gMs, buttonPressed, &vision);
     telemetry = ball_rod_get_telemetry();
@@ -1060,6 +1070,7 @@ int main(void)
     gLastOledUpdateMs = (uint32_t) (0U - APP_OLED_UPDATE_MS);
     gBallLastStatusMs = 0U;
     gBallLastEventCounter = 0U;
+    gBallLastTargetUpdateCounter = 0U;
 
     while (1) {
         if (take_control_tick()) {
