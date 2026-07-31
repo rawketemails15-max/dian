@@ -11,6 +11,7 @@
 # Local IDE workspace state
 .metadata/
 .theia/
+**/.clangd
 
 # Local assistant/tooling state
 .agents/

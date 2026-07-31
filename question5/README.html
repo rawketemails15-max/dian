@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>26H 第五问：启停角度补偿与终点平滑停车</title>
+  <style>
+    body{max-width:920px;margin:36px auto;padding:0 24px;font:16px/1.7 system-ui,sans-serif;color:#222}
+    h1,h2{line-height:1.3} code{background:#f1f3f5;padding:2px 5px;border-radius:4px}
+    .note{border-left:4px solid #1683ff;padding:8px 14px;background:#f5f9ff}
+  </style>
+</head>
+<body>
+  <h1>26H 第五问：启停角度补偿与终点平滑停车</h1>
+  <p>MSPM0G3507 同时运行循迹与 D36A 球杆闭环。球控和底盘故障仍互不联锁；底盘只在启动和终点减速阶段提供预定角度前馈。</p>
+  <h2>启动</h2>
+  <p>第一次短按只启动球控。之后在 1000 ms 内完成两次短按，底盘先刹车预倾 100 ms，再用 500 ms 将循迹 PWM 从 0 平滑增加到正常值。运行中的双击被忽略。</p>
+  <h2>终点停车</h2>
+  <p>至少四路相邻黑线连续确认两次后，先以低速 PID 循迹摆正 100 ms，再在 900 ms 内把基础 PWM 和转向修正同比下降到 0，随后刹车。球控继续运行。</p>
+  <h2>常用参数（app_config.h）</h2>
+  <ul>
+    <li><code>APP_Q5_BALL_START_ACCEL_COMP_STEPS</code>：默认 +12 微步，调启动偏移。</li>
+    <li><code>APP_Q5_BALL_BRAKE_ACCEL_COMP_STEPS</code>：默认 -12 微步，调刹车偏移。</li>
+    <li><code>APP_Q5_FINISH_ALIGN_PWM</code>：默认 1800，调终点后约 34 cm 的停车距离。</li>
+  </ul>
+  <p>角度补偿建议每次只改 2～4 微步，软件限幅为 ±24 微步，总杆角仍受原有 ±64 微步工作限制。</p>
+  <p><code>SYSCFG_DL_init()</code> 完成基础引脚配置后，OLED 会在所有其他应用驱动之前初始化。OLED 上电时由 PB14 保持低电平复位，释放后等待 120 ms；初始化成功时先全屏点亮约 300 ms，再显示 <code>0.0s</code>。</p>
+  <p class="note">K230 程序、UART 帧、115200 8N1 和引脚分配均未修改。SysConfig 仅调整 OLED 复位脚的上电初值。当前使用线性 PWM 下降近似恒减速，本版本不启用 MPU6050。</p>
+</body>
+</html>
