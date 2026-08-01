@@ -29,7 +29,7 @@
 #define APP_Q2_LINE_PID_KP                        (5)
 #define APP_Q2_LINE_PID_KD                        (10)
 
-#define APP_Q456_TRACK_BASE_PWM                  (2500U)
+#define APP_Q456_TRACK_BASE_PWM                  (2250U)
 #define APP_Q456_TRACK_FINAL_PWM                 (1000U)
 #define APP_Q456_TRACK_PWM_SLEW_PER_TICK          (100)
 #define APP_Q456_LINE_PID_KP                      (8)
@@ -96,11 +96,15 @@
 /*
  * Stable chassis supervisor used only by questions 4, 5 and 6.  These modes
  * keep tracking until reset or power-off; only the startup ramp applies.
+ * The common-mode PWM slope estimates forward chassis acceleration.  Positive
+ * compensation requests the configured front-down direction.
  */
-#define APP_Q5_BALL_START_ACCEL_COMP_STEPS       (12.0f)
-#define APP_Q5_BALL_ACCEL_COMP_LIMIT_STEPS        (24.0f)
-#define APP_Q5_START_PRELOAD_MS                   (100U)
-#define APP_Q5_START_ACCEL_MS                     (500U)
+#define APP_Q456_START_PRELOAD_MS                 (100U)
+#define APP_Q456_START_ACCEL_MS                   (2000U)
+#define APP_Q456_BALL_ACCEL_FF_DEADBAND_PWM_PER_TICK (2.0f)
+#define APP_Q456_BALL_ACCEL_FF_GAIN_STEPS_PER_PWM_TICK (6.40f)
+#define APP_Q456_BALL_ACCEL_FF_LIMIT_STEPS          (40.0f)
+#define APP_Q456_BALL_ACCEL_FF_SLEW_STEPS_PER_TICK  (2.0f)
 
 /*
  * Ball rod installation.

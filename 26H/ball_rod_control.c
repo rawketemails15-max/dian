@@ -621,8 +621,8 @@ void ball_rod_start_practice(uint32_t nowMs)
 void ball_rod_set_chassis_accel_compensation_steps(float steps)
 {
     gChassisAccelCompensation = clamp_float(steps,
-        -APP_Q5_BALL_ACCEL_COMP_LIMIT_STEPS,
-        APP_Q5_BALL_ACCEL_COMP_LIMIT_STEPS);
+        -APP_Q456_BALL_ACCEL_FF_LIMIT_STEPS,
+        APP_Q456_BALL_ACCEL_FF_LIMIT_STEPS);
 }
 
 void ball_rod_pause(void)

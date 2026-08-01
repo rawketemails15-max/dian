@@ -22,12 +22,20 @@ import steel_ball_motion_wifi_320_full_v3 as platform
 # V2 detector and coordinate spaces
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "li-v2-full-control-1"
+SCRIPT_VERSION = "li-v2-full-control-roi-2"
 MODEL_PATH = "/sdcard/best_v2.kmodel"
 DETECTION_SIZE = [640, 360]
 MODEL_INPUT_SIZE = [320, 320]
 DISPLAY_SIZE = [800, 480]
 CONTROL_SIZE = [320, 320]
+
+DETECTION_ROI_X = 0
+DETECTION_ROI_Y = 190
+DETECTION_ROI_WIDTH = 800
+DETECTION_ROI_HEIGHT = 100
+DETECTION_ROI_COLOR = (255, 255, 255, 0)
+DETECTION_ROI_THICKNESS = 2
+BALL_BOX_COLOR = (255, 0, 255, 0)
 
 LABELS = ["ball"]
 CONF_THRESHOLD = 0.30
@@ -55,6 +63,18 @@ def clamp(value, minimum, maximum):
     if value > maximum:
         return maximum
     return value
+
+
+def point_in_detection_roi(display_x, display_y):
+    """Return whether a display-space point is inside the fixed beam ROI."""
+    return (
+        DETECTION_ROI_X
+        <= display_x
+        < DETECTION_ROI_X + DETECTION_ROI_WIDTH
+        and DETECTION_ROI_Y
+        <= display_y
+        < DETECTION_ROI_Y + DETECTION_ROI_HEIGHT
+    )
 
 
 def display_x_to_control_x(display_x, display_width=DISPLAY_SIZE[0]):
@@ -104,7 +124,7 @@ def target_q4_to_display_x(target_q4, display_width=DISPLAY_SIZE[0]):
 
 
 def get_best_ball(result):
-    """Return the highest-confidence class-0 detection in display coordinates."""
+    """Return the best class-0 detection whose center is inside the beam ROI."""
     if result is None:
         return None
 
@@ -135,19 +155,22 @@ def get_best_ball(result):
         except Exception:
             continue
 
+        center_x = box_x + box_w // 2
+        center_y = box_y + box_h // 2
         if (
             class_id != 0
             or score < CONF_THRESHOLD
             or box_w <= 0
             or box_h <= 0
+            or not point_in_detection_roi(center_x, center_y)
             or score <= best_score
         ):
             continue
 
         best_score = score
         best_ball = (
-            box_x + box_w // 2,
-            box_y + box_h // 2,
+            center_x,
+            center_y,
             box_x,
             box_y,
             box_w,
@@ -247,6 +270,18 @@ class MotionEstimator:
                 0.0,
                 float(CONTROL_SIZE[1] - 1),
             )
+            predicted_display_x = (
+                predicted_x * self.display_width / CONTROL_SIZE[0]
+            )
+            predicted_display_y = (
+                predicted_y * self.display_height / CONTROL_SIZE[1]
+            )
+            if not point_in_detection_roi(
+                predicted_display_x,
+                predicted_display_y,
+            ):
+                self.reset()
+                return None
             return (
                 predicted_x,
                 predicted_y,
@@ -403,8 +438,7 @@ class OsdRenderer:
     def draw(
         self,
         pipeline,
-        yolo,
-        result,
+        best_ball,
         motion,
         target_line,
         uart_sender,
@@ -420,7 +454,44 @@ class OsdRenderer:
         try:
             osd = pipeline.osd_img
             osd.clear()
-            yolo.draw_result(result, osd)
+            osd.draw_rectangle(
+                DETECTION_ROI_X,
+                DETECTION_ROI_Y,
+                DETECTION_ROI_WIDTH - 1,
+                DETECTION_ROI_HEIGHT - 1,
+                color=DETECTION_ROI_COLOR,
+                thickness=DETECTION_ROI_THICKNESS,
+            )
+
+            if best_ball is not None:
+                box_left = int(clamp(
+                    best_ball[2],
+                    0,
+                    DISPLAY_SIZE[0] - 1,
+                ))
+                box_top = int(clamp(
+                    best_ball[3],
+                    0,
+                    DISPLAY_SIZE[1] - 1,
+                ))
+                box_right = int(clamp(
+                    best_ball[2] + best_ball[4],
+                    box_left + 1,
+                    DISPLAY_SIZE[0],
+                ))
+                box_bottom = int(clamp(
+                    best_ball[3] + best_ball[5],
+                    box_top + 1,
+                    DISPLAY_SIZE[1],
+                ))
+                osd.draw_rectangle(
+                    box_left,
+                    box_top,
+                    box_right - box_left,
+                    box_bottom - box_top,
+                    color=BALL_BOX_COLOR,
+                    thickness=2,
+                )
 
             line_x = target_line.display_x()
             line_width = 6 if target_line.dragging else 4
@@ -535,12 +606,42 @@ def create_yolo():
     return yolo
 
 
+def create_media_pipeline(network_allowed):
+    """Create either the current or legacy platform media pipeline."""
+    try:
+        return platform.CombinedMediaPipeline(
+            enable_network=network_allowed
+        )
+    except TypeError as error:
+        if "enable_network" not in str(error):
+            raise
+
+        print(
+            "检测到旧版平台媒体接口，改用无参数兼容模式；"
+            "建议同步更新steel_ball_motion_wifi_320_full_v3.py"
+        )
+        pipeline = platform.CombinedMediaPipeline()
+        if not hasattr(pipeline, "network_enabled"):
+            # The legacy pipeline always creates VENC/RTSP resources.
+            pipeline.network_enabled = True
+        return pipeline
+
+
 def print_startup_summary(pipeline, ap_ip, restart_count):
     print("=" * 60)
     print("K230 V2完整视觉:", SCRIPT_VERSION)
     print("模型:", MODEL_PATH)
     print("检测通道: 640x360 RGB888P -> 320x320 model")
     print("LCD: 800x480, 每个推理帧刷新OSD")
+    print(
+        "固定钢球ROI: x=%d..%d y=%d..%d (球心判定)"
+        % (
+            DETECTION_ROI_X,
+            DETECTION_ROI_X + DETECTION_ROI_WIDTH - 1,
+            DETECTION_ROI_Y,
+            DETECTION_ROI_Y + DETECTION_ROI_HEIGHT - 1,
+        )
+    )
     if pipeline.network_enabled:
         print(
             "RTSP: rtsp://%s:%d/%s (%dx%d @ %d FPS)"
@@ -665,8 +766,7 @@ def run_media_loop(
         stage_started_us = time.ticks_us()
         renderer.draw(
             pipeline,
-            yolo,
-            result,
+            best_ball,
             motion,
             target_line,
             uart_sender,
@@ -742,9 +842,7 @@ def main():
 
         while True:
             try:
-                pipeline = platform.CombinedMediaPipeline(
-                    enable_network=network_allowed
-                )
+                pipeline = create_media_pipeline(network_allowed)
                 pipeline.start()
                 if not pipeline.network_enabled:
                     network_allowed = False

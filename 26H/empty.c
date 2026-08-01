@@ -156,6 +156,7 @@ static bool gTargetSelectionAllowed;
 static bool gTargetLocked;
 static uint32_t gDriveStartPreloadMs;
 static uint32_t gDriveMotionStartMs;
+static float gQ456BallAccelFeedforwardSteps;
 static const DriveProfile *gDriveProfile = &gQ2DriveProfile;
 
 static uint8_t gButtonRaw;
@@ -196,6 +197,33 @@ static int32_t clamp_i32(int32_t value, int32_t minimum, int32_t maximum)
 }
 
 static int32_t slew_i32(int32_t current, int32_t target, int32_t maximumStep)
+{
+    if (target > (current + maximumStep)) {
+        return current + maximumStep;
+    }
+    if (target < (current - maximumStep)) {
+        return current - maximumStep;
+    }
+    return target;
+}
+
+static float abs_float(float value)
+{
+    return (value < 0.0f) ? -value : value;
+}
+
+static float clamp_float(float value, float minimum, float maximum)
+{
+    if (value < minimum) {
+        return minimum;
+    }
+    if (value > maximum) {
+        return maximum;
+    }
+    return value;
+}
+
+static float slew_float(float current, float target, float maximumStep)
 {
     if (target > (current + maximumStep)) {
         return current + maximumStep;
@@ -989,6 +1017,7 @@ static bool button_release_event(uint32_t *heldMs)
 
 static void enter_fault(void)
 {
+    gQ456BallAccelFeedforwardSteps = 0.0f;
     ball_rod_set_chassis_accel_compensation_steps(0.0f);
     motor_control_brake();
     gDriveState = DRIVE_FAULT;
@@ -1000,6 +1029,7 @@ static void enter_fault(void)
 static void enter_complete(void)
 {
     gFrozenElapsedMs = (uint32_t) (gMs - gRunStartMs);
+    gQ456BallAccelFeedforwardSteps = 0.0f;
     ball_rod_set_chassis_accel_compensation_steps(0.0f);
     motor_control_brake();
     gDriveState = DRIVE_COMPLETE;
@@ -1024,6 +1054,39 @@ static void reset_drive_controller(void)
     gFinishArmed = false;
     gDriveStartPreloadMs = gMs;
     gDriveMotionStartMs = gMs;
+    gQ456BallAccelFeedforwardSteps = 0.0f;
+    ball_rod_set_chassis_accel_compensation_steps(0.0f);
+}
+
+static float q456_start_accel_feedforward_target(void)
+{
+    float plannedPwmDeltaPerTick =
+        ((float) gQ456DriveProfile.basePwm * (float) APP_CONTROL_TICK_MS) /
+        (float) APP_Q456_START_ACCEL_MS;
+    float feedforwardSteps;
+
+    if (abs_float(plannedPwmDeltaPerTick) <=
+        APP_Q456_BALL_ACCEL_FF_DEADBAND_PWM_PER_TICK) {
+        return 0.0f;
+    }
+
+    feedforwardSteps = plannedPwmDeltaPerTick *
+        APP_Q456_BALL_ACCEL_FF_GAIN_STEPS_PER_PWM_TICK;
+    return clamp_float(feedforwardSteps,
+        -APP_Q456_BALL_ACCEL_FF_LIMIT_STEPS,
+        APP_Q456_BALL_ACCEL_FF_LIMIT_STEPS);
+}
+
+static void q456_service_start_accel_feedforward(bool accelerating)
+{
+    float target = accelerating ?
+        q456_start_accel_feedforward_target() : 0.0f;
+
+    gQ456BallAccelFeedforwardSteps = slew_float(
+        gQ456BallAccelFeedforwardSteps, target,
+        APP_Q456_BALL_ACCEL_FF_SLEW_STEPS_PER_TICK);
+    ball_rod_set_chassis_accel_compensation_steps(
+        gQ456BallAccelFeedforwardSteps);
 }
 
 static void start_drive_motion(void)
@@ -1049,8 +1112,6 @@ static void start_run(const DriveProfile *profile)
         motor_control_brake();
         gDriveStartPreloadMs = gMs;
         gDriveState = DRIVE_START_PRELOAD;
-        ball_rod_set_chassis_accel_compensation_steps(
-            APP_Q5_BALL_START_ACCEL_COMP_STEPS);
         DL_GPIO_setPins(LED_PORT, LED_led_PIN);
     } else {
         start_drive_motion();
@@ -1151,11 +1212,12 @@ static void update_line_control(uint8_t lineMask)
 
     if (gDriveProfile->stableSupervisor) {
         profileElapsedMs = (uint32_t) (gMs - gDriveMotionStartMs);
-        if (profileElapsedMs < APP_Q5_START_ACCEL_MS) {
+        if (profileElapsedMs < APP_Q456_START_ACCEL_MS) {
             basePwm = (int32_t) (((uint32_t) basePwm *
-                profileElapsedMs) / APP_Q5_START_ACCEL_MS);
+                profileElapsedMs) / APP_Q456_START_ACCEL_MS);
+            q456_service_start_accel_feedforward(true);
         } else {
-            ball_rod_set_chassis_accel_compensation_steps(0.0f);
+            q456_service_start_accel_feedforward(false);
         }
     }
     targetPwmA = clamp_i32(basePwm - correction, 0, 8000);
@@ -1310,9 +1372,12 @@ static void question5_tick_5ms(void)
         gQuestion5DriveClickCount = 0U;
     }
 
-    if ((gDriveState == DRIVE_START_PRELOAD) &&
-        elapsed_ms(gDriveStartPreloadMs, APP_Q5_START_PRELOAD_MS)) {
-        start_drive_motion();
+    if (gDriveState == DRIVE_START_PRELOAD) {
+        q456_service_start_accel_feedforward(true);
+        if (elapsed_ms(gDriveStartPreloadMs,
+                APP_Q456_START_PRELOAD_MS)) {
+            start_drive_motion();
+        }
     }
     if (drive_wheels_running()) {
         drive_active_tick();
