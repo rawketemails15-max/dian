@@ -25,7 +25,8 @@ typedef enum {
 
 typedef enum {
     BALL_RECOVERY_NONE = 0,
-    BALL_RECOVERY_STATIC_FRICTION
+    BALL_RECOVERY_STATIC_FRICTION,
+    BALL_RECOVERY_ENDPOINT
 } BallRecoveryPhase;
 
 typedef enum {

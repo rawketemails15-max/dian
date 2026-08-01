@@ -5,7 +5,26 @@
 #include "ti_msp_dl_config.h"
 
 #define BALL_VISION_FLAG_PREDICTED (0x02U)
-#define FLOAT_TWO_PI                (6.2831853f)
+
+/*
+ * Q4/Q5/Q6 balance law adapted from the H-problem open-source
+ * BalanceController (AFL-3.0).  The original drives a ZDT absolute-angle
+ * motor.  This derivative port retains its estimator/state logic and maps the
+ * requested angle to bounded D36A relative microsteps.
+ */
+
+typedef enum {
+    BALL_OPEN_MOTION_UNKNOWN = 0,
+    BALL_OPEN_MOTION_STATIONARY,
+    BALL_OPEN_MOTION_BREAKAWAY,
+    BALL_OPEN_MOTION_ROLLING,
+    BALL_OPEN_MOTION_SETTLED
+} BallOpenMotionState;
+
+typedef struct {
+    uint32_t timeMs;
+    int16_t x;
+} BallVelocitySample;
 
 typedef enum {
     BALL_PRACTICE_IDLE = 0,
@@ -31,9 +50,24 @@ static float gContinuousTilt;
 static float gTiltResidual;
 static float gFrictionBoost;
 static float gChassisAccelCompensation;
-static float gIntegral;
-static uint8_t gStuckFrames;
+static float gDisturbanceTrim;
+static float gSettledHoldTilt;
+static float gMotionAnchorX;
+static float gBreakawayAnchorX;
+static BallVelocitySample
+    gVelocitySamples[APP_Q456_BALL_VELOCITY_SAMPLE_COUNT];
+static uint8_t gVelocitySampleCount;
+static uint32_t gStationarySinceMs;
+static uint32_t gSettledExitSinceMs;
+static uint32_t gBreakawayStartedMs;
+static uint32_t gTrimErrorSinceMs;
+static uint32_t gEndpointSafeSinceMs;
+static int8_t gTrimErrorDirection;
+static int8_t gBreakawayErrorDirection;
+static int8_t gEndpointSide;
+static bool gLastOutputSaturated;
 static bool gHoldLatched;
+static BallOpenMotionState gOpenMotionState;
 static bool gRunRequested;
 static bool gSafetyLatched;
 static int32_t gMinimumReached;
@@ -116,9 +150,22 @@ static void reset_control_history(int32_t currentSteps, uint32_t nowMs)
     gContinuousTilt = (float) currentSteps;
     gTiltResidual = 0.0f;
     gFrictionBoost = 0.0f;
-    gIntegral = 0.0f;
-    gStuckFrames = 0U;
+    gDisturbanceTrim = 0.0f;
+    gSettledHoldTilt = (float) currentSteps;
+    gMotionAnchorX = 0.0f;
+    gBreakawayAnchorX = 0.0f;
+    gVelocitySampleCount = 0U;
+    gStationarySinceMs = nowMs;
+    gSettledExitSinceMs = 0U;
+    gBreakawayStartedMs = 0U;
+    gTrimErrorSinceMs = 0U;
+    gEndpointSafeSinceMs = 0U;
+    gTrimErrorDirection = 0;
+    gBreakawayErrorDirection = 0;
+    gEndpointSide = 0;
+    gLastOutputSaturated = false;
     gHoldLatched = false;
+    gOpenMotionState = BALL_OPEN_MOTION_UNKNOWN;
 }
 
 static void enter_waiting_vision(uint32_t nowMs)
@@ -238,84 +285,381 @@ static void service_button(uint32_t nowMs, bool pressed)
 #endif
 }
 
-static void enter_vision_fault(void)
-{
-    BallStepperStatus stepper;
+static void command_continuous_tilt(float desiredTilt, bool leveling);
 
-    ball_stepper_hold();
-    stepper = ball_stepper_get_status();
-    reset_control_history(stepper.currentSteps, 0U);
-    gRealArmFrames = 0U;
+static void enter_vision_fault(uint32_t nowMs)
+{
     if (gTelemetry.state != BALL_ROD_VISION_FAULT) {
+        BallStepperStatus stepper = ball_stepper_get_status();
+
+        reset_control_history(stepper.currentSteps, nowMs);
         publish_event(BALL_STATUS_EVENT_VISION_FAULT);
     }
+    gRealArmFrames = 0U;
     gTelemetry.state = BALL_ROD_VISION_FAULT;
     gTelemetry.motionPhase = BALL_MOTION_IDLE;
     gTelemetry.faultReason = BALL_FAULT_VISION_STALE;
+    /* Open-source vision-loss policy: return toward level, never freeze a
+     * stale corrective tilt.  Chassis acceleration feedforward remains valid. */
+    command_continuous_tilt(
+        APP_BALL_NEUTRAL_STEPS + gChassisAccelCompensation, true);
 }
 
-static void update_velocity_filter(int16_t measuredVelocity, uint32_t dtMs)
+static void shift_velocity_samples_left(void)
 {
-    float dtSeconds;
-    float coefficient;
-
-    if (dtMs < APP_BALL_OUTER_DT_MIN_MS) {
-        dtMs = APP_BALL_OUTER_DT_MIN_MS;
-    } else if (dtMs > APP_BALL_OUTER_DT_MAX_MS) {
-        dtMs = APP_BALL_OUTER_DT_MAX_MS;
+    for (uint8_t i = 1U; i < gVelocitySampleCount; i++) {
+        gVelocitySamples[i - 1U] = gVelocitySamples[i];
     }
-    dtSeconds = (float) dtMs * 0.001f;
-    coefficient = FLOAT_TWO_PI * APP_BALL_VELOCITY_FILTER_HZ * dtSeconds;
-    coefficient = coefficient / (1.0f + coefficient);
-    gFilteredVelocity +=
-        coefficient * ((float) measuredVelocity - gFilteredVelocity);
+    if (gVelocitySampleCount != 0U) {
+        gVelocitySampleCount--;
+    }
 }
 
-static float apply_rough_tube_compensation(float baseTilt, int16_t errorQ4)
+static void update_velocity_estimator(uint32_t nowMs, int16_t ballX)
 {
-    float mappedError = (float) (APP_BALL_POSITION_TO_TILT_SIGN * errorQ4);
-    float errorDirection = (mappedError >= 0.0f) ? 1.0f : -1.0f;
-    float breakaway = (errorDirection > 0.0f) ?
-        APP_BALL_BREAKAWAY_STEPS_POS : APP_BALL_BREAKAWAY_STEPS_NEG;
-    bool nearlyStopped =
-        abs_float(gFilteredVelocity) <= APP_BALL_STUCK_SPEED_PX_S;
-    bool movingTowardTarget =
-        ((float) errorQ4 * gFilteredVelocity) > 0.0f;
+    float meanTime = 0.0f;
+    float meanX = 0.0f;
+    float numerator = 0.0f;
+    float denominator = 0.0f;
+    float velocity;
+    int16_t minimumX = ballX;
+    int16_t maximumX = ballX;
+    uint32_t firstTime;
 
-    if ((gFrictionBoost * errorDirection) < 0.0f) {
-        gFrictionBoost = 0.0f;
+    if ((gVelocitySampleCount != 0U) &&
+        ((nowMs <= gVelocitySamples[gVelocitySampleCount - 1U].timeMs) ||
+        ((uint32_t) (nowMs -
+            gVelocitySamples[gVelocitySampleCount - 1U].timeMs) >
+            APP_Q456_BALL_VELOCITY_WINDOW_MS))) {
+        gVelocitySampleCount = 0U;
+        gFilteredVelocity = 0.0f;
     }
-    if (nearlyStopped) {
-        if (gStuckFrames < 255U) {
-            gStuckFrames++;
+
+    while ((gVelocitySampleCount > 2U) &&
+        ((uint32_t) (nowMs - gVelocitySamples[0].timeMs) >
+            APP_Q456_BALL_VELOCITY_WINDOW_MS)) {
+        shift_velocity_samples_left();
+    }
+    if (gVelocitySampleCount >= APP_Q456_BALL_VELOCITY_SAMPLE_COUNT) {
+        shift_velocity_samples_left();
+    }
+    gVelocitySamples[gVelocitySampleCount].timeMs = nowMs;
+    gVelocitySamples[gVelocitySampleCount].x = ballX;
+    gVelocitySampleCount++;
+
+    if ((gVelocitySampleCount < 3U) ||
+        ((uint32_t) (gVelocitySamples[gVelocitySampleCount - 1U].timeMs -
+            gVelocitySamples[0].timeMs) <
+            APP_Q456_BALL_VELOCITY_MIN_SPAN_MS)) {
+        return;
+    }
+
+    firstTime = gVelocitySamples[0].timeMs;
+    for (uint8_t i = 0U; i < gVelocitySampleCount; i++) {
+        meanTime +=
+            (float) (gVelocitySamples[i].timeMs - firstTime);
+        meanX += (float) gVelocitySamples[i].x;
+        if (gVelocitySamples[i].x < minimumX) {
+            minimumX = gVelocitySamples[i].x;
         }
+        if (gVelocitySamples[i].x > maximumX) {
+            maximumX = gVelocitySamples[i].x;
+        }
+    }
+    meanTime /= (float) gVelocitySampleCount;
+    meanX /= (float) gVelocitySampleCount;
+    for (uint8_t i = 0U; i < gVelocitySampleCount; i++) {
+        float sampleTime =
+            (float) (gVelocitySamples[i].timeMs - firstTime);
+        float timeDelta = sampleTime - meanTime;
+
+        numerator += timeDelta * ((float) gVelocitySamples[i].x - meanX);
+        denominator += timeDelta * timeDelta;
+    }
+    if (denominator <= 0.001f) {
+        return;
+    }
+    velocity = (numerator / denominator) * 1000.0f;
+    if ((maximumX - minimumX) <= 1) {
+        velocity = 0.0f;
+    }
+    gFilteredVelocity =
+        APP_Q456_BALL_VELOCITY_FILTER_ALPHA * velocity +
+        (1.0f - APP_Q456_BALL_VELOCITY_FILTER_ALPHA) *
+            gFilteredVelocity;
+}
+
+static float derivative_brake_scale(float errorPixels)
+{
+    float distance;
+    float fraction;
+
+    if ((errorPixels * gFilteredVelocity) <= 0.0f) {
+        return 1.0f;
+    }
+    distance = abs_float(errorPixels);
+    if (distance >= APP_Q456_BALL_BRAKE_START_ERROR_PX) {
+        return APP_Q456_BALL_BRAKE_FAR_SCALE;
+    }
+    if (distance <= APP_Q456_BALL_BRAKE_FULL_ERROR_PX) {
+        return 1.0f;
+    }
+    fraction = (APP_Q456_BALL_BRAKE_START_ERROR_PX - distance) /
+        (APP_Q456_BALL_BRAKE_START_ERROR_PX -
+            APP_Q456_BALL_BRAKE_FULL_ERROR_PX);
+    return APP_Q456_BALL_BRAKE_FAR_SCALE +
+        (1.0f - APP_Q456_BALL_BRAKE_FAR_SCALE) * fraction;
+}
+
+static void latch_settled_hold(uint32_t nowMs)
+{
+    if (!gHoldLatched) {
+        publish_event(BALL_STATUS_EVENT_CENTER_SETTLED);
+    }
+    gHoldLatched = true;
+    gOpenMotionState = BALL_OPEN_MOTION_SETTLED;
+    gSettledHoldTilt = gContinuousTilt - gChassisAccelCompensation;
+    gSettledExitSinceMs = 0U;
+    gFrictionBoost = 0.0f;
+    gBreakawayStartedMs = 0U;
+    gBreakawayErrorDirection = 0;
+    gStationarySinceMs = nowMs;
+}
+
+static void release_settled_hold(uint32_t nowMs, int16_t ballX)
+{
+    gHoldLatched = false;
+    gSettledExitSinceMs = 0U;
+    gOpenMotionState =
+        (abs_float(gFilteredVelocity) >=
+            APP_Q456_BALL_ROLLING_SPEED_PX_S) ?
+        BALL_OPEN_MOTION_ROLLING : BALL_OPEN_MOTION_STATIONARY;
+    gMotionAnchorX = (float) ballX;
+    gStationarySinceMs = nowMs;
+    publish_event(BALL_STATUS_EVENT_CORRECTION_RESUME);
+}
+
+static void update_motion_state(
+    uint32_t nowMs, int16_t ballX, float errorPixels)
+{
+    float displacement;
+    bool rolling;
+    bool fastOutward;
+
+    if (gOpenMotionState == BALL_OPEN_MOTION_UNKNOWN) {
+        gOpenMotionState = BALL_OPEN_MOTION_STATIONARY;
+        gMotionAnchorX = (float) ballX;
+        gStationarySinceMs = nowMs;
+        return;
+    }
+
+    if (gHoldLatched) {
+        fastOutward =
+            (abs_float(gFilteredVelocity) >=
+                APP_Q456_BALL_SETTLED_FAST_EXIT_SPEED_PX_S) &&
+            ((errorPixels * gFilteredVelocity) < 0.0f);
+        if ((abs_float(errorPixels) <=
+                APP_Q456_BALL_SETTLED_EXIT_ERROR_PX) &&
+            !fastOutward) {
+            gSettledExitSinceMs = 0U;
+            return;
+        }
+        if (fastOutward) {
+            release_settled_hold(nowMs, ballX);
+            return;
+        }
+        if (gSettledExitSinceMs == 0U) {
+            gSettledExitSinceMs = nowMs;
+            return;
+        }
+        if ((uint32_t) (nowMs - gSettledExitSinceMs) >=
+            APP_Q456_BALL_SETTLED_EXIT_CONFIRM_MS) {
+            release_settled_hold(nowMs, ballX);
+        }
+        return;
+    }
+
+    displacement = abs_float((float) ballX - gMotionAnchorX);
+    rolling = displacement >=
+        APP_Q456_BALL_ROLLING_DISPLACEMENT_PX;
+    if (rolling) {
+        gOpenMotionState = BALL_OPEN_MOTION_ROLLING;
+        gMotionAnchorX = (float) ballX;
+        gStationarySinceMs = nowMs;
+        return;
+    }
+    if (gStationarySinceMs == 0U) {
+        gStationarySinceMs = nowMs;
+    }
+    if (((uint32_t) (nowMs - gStationarySinceMs) >=
+            APP_Q456_BALL_STATIONARY_CONFIRM_MS) &&
+        (abs_float(gFilteredVelocity) <=
+            APP_Q456_BALL_STATIONARY_SPEED_PX_S)) {
+        if (abs_float(errorPixels) <= APP_Q456_BALL_DEADBAND_PX) {
+            latch_settled_hold(nowMs);
+        } else if (gOpenMotionState != BALL_OPEN_MOTION_BREAKAWAY) {
+            gOpenMotionState = BALL_OPEN_MOTION_STATIONARY;
+        }
+    }
+}
+
+static float update_breakaway_offset(
+    uint32_t nowMs, uint32_t dtMs, int16_t ballX, float errorPixels)
+{
+    float dtSeconds = (float) dtMs * 0.001f;
+    int8_t errorDirection =
+        (errorPixels > 0.0f) ? 1 : ((errorPixels < 0.0f) ? -1 : 0);
+    float correctiveDirection =
+        (float) (APP_BALL_POSITION_TO_TILT_SIGN * errorDirection);
+    bool staticError =
+        abs_float(errorPixels) > APP_Q456_BALL_BREAKAWAY_ERROR_MIN_PX;
+    bool lowSpeed = abs_float(gFilteredVelocity) <
+        APP_Q456_BALL_ROLLING_SPEED_PX_S;
+    bool staticState =
+        (gOpenMotionState == BALL_OPEN_MOTION_STATIONARY) ||
+        (gOpenMotionState == BALL_OPEN_MOTION_BREAKAWAY);
+    float desired = 0.0f;
+    float rate = APP_Q456_BALL_BREAKAWAY_RELEASE_STEPS_PER_S;
+
+    if (staticError && lowSpeed && staticState) {
+        float elapsedSeconds;
+        float magnitude;
+
+        if (gOpenMotionState != BALL_OPEN_MOTION_BREAKAWAY ||
+            gBreakawayErrorDirection != errorDirection) {
+            gOpenMotionState = BALL_OPEN_MOTION_BREAKAWAY;
+            gBreakawayStartedMs = nowMs;
+            gBreakawayAnchorX = (float) ballX;
+            gBreakawayErrorDirection = errorDirection;
+            publish_event(BALL_STATUS_EVENT_RECOVERY_REAPPLY);
+        }
+        elapsedSeconds =
+            (float) (nowMs - gBreakawayStartedMs) * 0.001f;
+        magnitude = APP_Q456_BALL_BREAKAWAY_INITIAL_STEPS +
+            APP_Q456_BALL_BREAKAWAY_ESCALATE_STEPS_PER_S * elapsedSeconds;
+        magnitude = clamp_float(magnitude, 0.0f,
+            APP_Q456_BALL_BREAKAWAY_MAX_STEPS);
+        magnitude = clamp_float(magnitude, 0.0f,
+            abs_float(errorPixels) *
+                APP_Q456_BALL_BREAKAWAY_ERROR_GAIN_STEPS_PER_PX);
+        desired = correctiveDirection * magnitude;
+        rate = APP_Q456_BALL_BREAKAWAY_RAMP_STEPS_PER_S;
     } else {
-        gStuckFrames = 0U;
+        gBreakawayStartedMs = 0U;
+        gBreakawayErrorDirection = 0;
     }
 
-    if ((gStuckFrames >= APP_BALL_STUCK_REAL_FRAMES) &&
-        (abs_float(gFrictionBoost) < APP_BALL_FRICTION_MAX_STEPS)) {
-        gFrictionBoost +=
-            errorDirection * APP_BALL_FRICTION_INCREMENT_STEPS;
-        gFrictionBoost = clamp_float(gFrictionBoost,
-            -APP_BALL_FRICTION_MAX_STEPS,
-            APP_BALL_FRICTION_MAX_STEPS);
-        gStuckFrames = 0U;
-        publish_event(BALL_STATUS_EVENT_RECOVERY_REAPPLY);
-    } else if (movingTowardTarget && !nearlyStopped) {
+    if ((errorDirection == 0) ||
+        (abs_float(errorPixels) <=
+            APP_Q456_BALL_SETTLED_HOLD_ERROR_PX) ||
+        ((gFrictionBoost * correctiveDirection) < 0.0f)) {
+        gFrictionBoost = 0.0f;
+    } else {
+        bool targetProgress =
+            (errorPixels * gFilteredVelocity > 0.0f) &&
+            (abs_float((float) ballX - gBreakawayAnchorX) >=
+                APP_Q456_BALL_ROLLING_DISPLACEMENT_PX);
+        if (targetProgress) {
+            desired = 0.0f;
+            rate = APP_Q456_BALL_BREAKAWAY_RELEASE_STEPS_PER_S;
+            gOpenMotionState = BALL_OPEN_MOTION_ROLLING;
+        }
         gFrictionBoost = move_toward(
-            gFrictionBoost, 0.0f, APP_BALL_FRICTION_DECAY_STEPS);
+            gFrictionBoost, desired, rate * dtSeconds);
     }
+    return gFrictionBoost;
+}
 
-    /*
-     * Minimum effective tilt applies only while almost stationary.  When the
-     * ball is moving, the signed D term remains free to brake before crossing
-     * the red line.
-     */
-    if (nearlyStopped && (abs_float(baseTilt) < breakaway)) {
-        baseTilt = errorDirection * breakaway;
+static float update_disturbance_trim(
+    uint32_t nowMs, uint32_t dtMs, float errorPixels)
+{
+    int8_t direction =
+        (errorPixels > 0.0f) ? 1 : ((errorPixels < 0.0f) ? -1 : 0);
+    float speed = abs_float(gFilteredVelocity);
+    float dtSeconds = (float) dtMs * 0.001f;
+    float rate;
+
+    if (gHoldLatched || gLastOutputSaturated ||
+        (abs_float(errorPixels) <= APP_Q456_BALL_TRIM_DEADBAND_PX) ||
+        (speed >= APP_Q456_BALL_TRIM_VELOCITY_GATE_PX_S)) {
+        gTrimErrorDirection = 0;
+        gTrimErrorSinceMs = 0U;
+        return gDisturbanceTrim;
     }
-    return baseTilt + gFrictionBoost;
+    if (direction != gTrimErrorDirection) {
+        gTrimErrorDirection = direction;
+        gTrimErrorSinceMs = nowMs;
+        return gDisturbanceTrim;
+    }
+    if ((gTrimErrorSinceMs == 0U) ||
+        ((uint32_t) (nowMs - gTrimErrorSinceMs) <
+            APP_Q456_BALL_TRIM_ACTIVATION_MS)) {
+        return gDisturbanceTrim;
+    }
+    rate = APP_Q456_BALL_TRIM_GAIN_STEPS_PER_PX_S *
+        (abs_float(errorPixels) - APP_Q456_BALL_TRIM_DEADBAND_PX);
+    rate = clamp_float(rate, 0.0f,
+        APP_Q456_BALL_TRIM_MAX_RATE_STEPS_PER_S);
+    gDisturbanceTrim +=
+        (float) (APP_BALL_POSITION_TO_TILT_SIGN * direction) *
+        rate * dtSeconds;
+    gDisturbanceTrim = clamp_float(gDisturbanceTrim,
+        -APP_Q456_BALL_TRIM_LIMIT_STEPS,
+        APP_Q456_BALL_TRIM_LIMIT_STEPS);
+    return gDisturbanceTrim;
+}
+
+static bool endpoint_guard_active(
+    uint32_t nowMs, int16_t ballX)
+{
+    float endpoint = APP_Q456_BALL_RAIL_LENGTH_PX *
+        APP_Q456_BALL_ENDPOINT_MARGIN_RATIO;
+    float recovery = APP_Q456_BALL_RAIL_LENGTH_PX *
+        APP_Q456_BALL_ENDPOINT_RECOVERY_MARGIN_RATIO;
+    bool insideCore = ((float) ballX >= recovery) &&
+        ((float) ballX <= APP_Q456_BALL_RAIL_LENGTH_PX - recovery);
+    bool lowSpeed = abs_float(gFilteredVelocity) <=
+        APP_Q456_BALL_ENDPOINT_RECOVERY_SPEED_PX_S;
+
+    if (gEndpointSide == 0) {
+        if ((float) ballX <= endpoint) {
+            gEndpointSide = -1;
+        } else if ((float) ballX >=
+            APP_Q456_BALL_RAIL_LENGTH_PX - endpoint) {
+            gEndpointSide = 1;
+        }
+        if (gEndpointSide != 0) {
+            gEndpointSafeSinceMs = 0U;
+            gHoldLatched = false;
+            gFrictionBoost = 0.0f;
+            gDisturbanceTrim = 0.0f;
+            gTrimErrorDirection = 0;
+            gTrimErrorSinceMs = 0U;
+            publish_event(BALL_STATUS_EVENT_RECOVERY_BACKOFF);
+        }
+    }
+    if (gEndpointSide == 0) {
+        return false;
+    }
+    if (!insideCore || !lowSpeed) {
+        gEndpointSafeSinceMs = 0U;
+        return true;
+    }
+    if (gEndpointSafeSinceMs == 0U) {
+        gEndpointSafeSinceMs = nowMs;
+        return true;
+    }
+    if ((uint32_t) (nowMs - gEndpointSafeSinceMs) <
+        APP_Q456_BALL_ENDPOINT_RECOVERY_CONFIRM_MS) {
+        return true;
+    }
+    gEndpointSide = 0;
+    gEndpointSafeSinceMs = 0U;
+    gVelocitySampleCount = 0U;
+    gFilteredVelocity = 0.0f;
+    gOpenMotionState = BALL_OPEN_MOTION_UNKNOWN;
+    publish_event(BALL_STATUS_EVENT_CORRECTION_RESUME);
+    return false;
 }
 
 static void command_continuous_tilt(float desiredTilt, bool leveling)
@@ -348,6 +692,7 @@ static void command_continuous_tilt(float desiredTilt, bool leveling)
     ball_stepper_set_requested_hz((uint16_t) frequency);
 }
 
+#if 0
 static void update_controller_from_real_frame(
     uint32_t nowMs, const BallVisionSample *vision)
 {
@@ -464,6 +809,120 @@ static void update_controller_from_real_frame(
     }
 }
 
+#endif
+
+static void update_controller_from_real_frame(
+    uint32_t nowMs, const BallVisionSample *vision)
+{
+    uint32_t dtMs = (uint32_t) (nowMs - gLastOuterUpdateMs);
+    int16_t errorQ4 = (int16_t) ((int32_t) gTargetXQ4 -
+        (int32_t) vision->xQ4);
+    float errorPixels = (float) errorQ4 * (1.0f / 16.0f);
+    int16_t ballX = (int16_t) ((vision->xQ4 + 8U) / 16U);
+    float desiredTilt;
+    float controlError;
+    float kp;
+    float pTerm;
+    float dTerm;
+    float correction;
+    float trim;
+    float breakaway;
+    float brakeScale;
+
+    if (dtMs < APP_BALL_OUTER_DT_MIN_MS) {
+        dtMs = APP_BALL_OUTER_DT_MIN_MS;
+    } else if (dtMs > APP_BALL_OUTER_DT_MAX_MS) {
+        dtMs = APP_BALL_OUTER_DT_MAX_MS;
+    }
+    update_velocity_estimator(nowMs, ballX);
+    gLastOuterUpdateMs = nowMs;
+    gLastRealVisionMs = nowMs;
+    gHaveRealVision = true;
+
+    gTelemetry.ballX = ballX;
+    gTelemetry.ballErrorQ4 = errorQ4;
+    gTelemetry.ballError =
+        (int16_t) round_float((float) errorQ4 * (1.0f / 16.0f));
+
+    if (!gRunRequested) {
+        return;
+    }
+    if (gRealArmFrames < APP_BALL_VALID_FRAMES_TO_ARM) {
+        gRealArmFrames++;
+    }
+    if (gRealArmFrames < APP_BALL_VALID_FRAMES_TO_ARM) {
+        gTelemetry.state = BALL_ROD_WAITING_VISION;
+        gTelemetry.motionPhase = BALL_MOTION_IDLE;
+        return;
+    }
+    gTelemetry.faultReason = BALL_FAULT_NONE;
+
+    if (endpoint_guard_active(nowMs, ballX)) {
+        int8_t recoveryDirection =
+            (errorPixels > 0.0f) ? 1 :
+            ((errorPixels < 0.0f) ? -1 : -gEndpointSide);
+
+        gTelemetry.state = BALL_ROD_ACTIVE;
+        gTelemetry.motionPhase = BALL_MOTION_CORRECTING;
+        gOpenMotionState = BALL_OPEN_MOTION_ROLLING;
+        gFrictionBoost = 0.0f;
+        desiredTilt = APP_BALL_NEUTRAL_STEPS +
+            gChassisAccelCompensation +
+            (float) (APP_BALL_POSITION_TO_TILT_SIGN * recoveryDirection) *
+                APP_Q456_BALL_ENDPOINT_RECOVERY_TILT_STEPS;
+        command_continuous_tilt(desiredTilt, false);
+        return;
+    }
+
+    update_motion_state(nowMs, ballX, errorPixels);
+    if (gHoldLatched) {
+        gTelemetry.state = BALL_ROD_HOLD;
+        gTelemetry.motionPhase = BALL_MOTION_HOLD_RED_LINE;
+        gFrictionBoost = 0.0f;
+        gTiltResidual = 0.0f;
+        command_continuous_tilt(
+            gSettledHoldTilt + gChassisAccelCompensation, true);
+        return;
+    }
+
+    gTelemetry.state = BALL_ROD_ACTIVE;
+    gTelemetry.motionPhase = BALL_MOTION_CORRECTING;
+    controlError =
+        (abs_float(errorPixels) <= APP_Q456_BALL_DEADBAND_PX) ?
+        0.0f : errorPixels;
+    kp = ((gOpenMotionState == BALL_OPEN_MOTION_STATIONARY) ||
+        (gOpenMotionState == BALL_OPEN_MOTION_BREAKAWAY)) ?
+        APP_Q456_BALL_STATIONARY_KP_STEPS_PER_PX :
+        APP_Q456_BALL_ROLLING_KP_STEPS_PER_PX;
+    brakeScale = derivative_brake_scale(errorPixels);
+    pTerm = clamp_float(
+        (float) APP_BALL_POSITION_TO_TILT_SIGN * kp * controlError,
+        -APP_Q456_BALL_P_LIMIT_STEPS,
+        APP_Q456_BALL_P_LIMIT_STEPS);
+    dTerm = clamp_float(
+        -(float) APP_BALL_POSITION_TO_TILT_SIGN *
+            APP_Q456_BALL_KD_STEPS_PER_PX_S *
+            brakeScale * gFilteredVelocity,
+        -APP_Q456_BALL_D_LIMIT_STEPS,
+        APP_Q456_BALL_D_LIMIT_STEPS);
+    trim = update_disturbance_trim(nowMs, dtMs, errorPixels);
+    breakaway = update_breakaway_offset(
+        nowMs, dtMs, ballX, errorPixels);
+    correction = clamp_float(pTerm + dTerm + breakaway,
+        -APP_Q456_BALL_DYNAMIC_LIMIT_STEPS,
+        APP_Q456_BALL_DYNAMIC_LIMIT_STEPS);
+    desiredTilt = APP_BALL_NEUTRAL_STEPS + trim +
+        gChassisAccelCompensation + correction;
+    gLastOutputSaturated =
+        (abs_float(pTerm) >= APP_Q456_BALL_P_LIMIT_STEPS) ||
+        (abs_float(dTerm) >= APP_Q456_BALL_D_LIMIT_STEPS) ||
+        (abs_float(pTerm + dTerm + breakaway) >
+            APP_Q456_BALL_DYNAMIC_LIMIT_STEPS) ||
+        (abs_float(desiredTilt) >
+            (float) APP_BALL_WORK_TILT_LIMIT_STEPS);
+    command_continuous_tilt(desiredTilt, false);
+}
+
 static void update_telemetry(
     uint32_t nowMs, const BallVisionSample *vision)
 {
@@ -502,9 +961,12 @@ static void update_telemetry(
             APP_BALL_HOLD_ENTER_ERROR_Q4;
     gTelemetry.approachingCenter =
         ((float) gTelemetry.ballErrorQ4 * gFilteredVelocity) > 0.0f;
-    gTelemetry.recoveryActive = abs_float(gFrictionBoost) > 0.0f;
-    gTelemetry.recoveryPhase = gTelemetry.recoveryActive ?
-        BALL_RECOVERY_STATIC_FRICTION : BALL_RECOVERY_NONE;
+    gTelemetry.recoveryActive =
+        (gEndpointSide != 0) || (abs_float(gFrictionBoost) > 0.0f);
+    gTelemetry.recoveryPhase = (gEndpointSide != 0) ?
+        BALL_RECOVERY_ENDPOINT :
+        ((abs_float(gFrictionBoost) > 0.0f) ?
+            BALL_RECOVERY_STATIC_FRICTION : BALL_RECOVERY_NONE);
     gTelemetry.crcErrors = vision->crcErrors;
     gTelemetry.sequenceDrops = vision->sequenceDrops;
     gTelemetry.rxOverflows = vision->rxOverflows;
@@ -529,16 +991,9 @@ void ball_rod_init(uint32_t nowMs)
     gHaveRealVision = false;
     gLastRealVisionMs = nowMs;
     gRunRequestMs = nowMs;
-    gLastOuterUpdateMs = nowMs;
     gRealArmFrames = 0U;
-    gFilteredVelocity = 0.0f;
-    gContinuousTilt = 0.0f;
-    gTiltResidual = 0.0f;
-    gFrictionBoost = 0.0f;
     gChassisAccelCompensation = 0.0f;
-    gIntegral = 0.0f;
-    gStuckFrames = 0U;
-    gHoldLatched = false;
+    reset_control_history(0, nowMs);
     gRunRequested = false;
     gSafetyLatched = false;
     gMinimumReached = 0;
@@ -583,8 +1038,13 @@ void ball_rod_set_target_x_q4(uint16_t targetXQ4)
     }
     gHoldLatched = false;
     gFrictionBoost = 0.0f;
-    gIntegral = 0.0f;
     gTiltResidual = 0.0f;
+    gVelocitySampleCount = 0U;
+    gFilteredVelocity = 0.0f;
+    gOpenMotionState = BALL_OPEN_MOTION_UNKNOWN;
+    gStationarySinceMs = 0U;
+    gBreakawayStartedMs = 0U;
+    gBreakawayErrorDirection = 0;
 }
 
 bool ball_rod_enable_driver(uint32_t nowMs)
@@ -624,7 +1084,7 @@ void ball_rod_start_practice(uint32_t nowMs)
     gPracticeBalanceTilt = gContinuousTilt;
     gHoldLatched = false;
     gFrictionBoost = 0.0f;
-    gIntegral = 0.0f;
+    gOpenMotionState = BALL_OPEN_MOTION_UNKNOWN;
     ball_rod_set_target_x_q4(APP_BALL_PRACTICE_TARGET_POS5_Q4);
     publish_event(BALL_STATUS_EVENT_CORRECTION_RESUME);
 }
@@ -701,7 +1161,7 @@ void ball_rod_tick_5ms(
         (gHaveRealVision &&
             ((uint32_t) (nowMs - gLastRealVisionMs) >
                 APP_BALL_VISION_STALE_MS)))) {
-        enter_vision_fault();
+        enter_vision_fault(nowMs);
     }
 #endif
 

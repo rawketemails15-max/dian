@@ -78,6 +78,7 @@ typedef enum {
     DRIVE_LEAVING_START,
     DRIVE_TRACKING,
     DRIVE_FINAL_APPROACH,
+    DRIVE_FINISH_RUNOUT,
     DRIVE_COMPLETE,
     DRIVE_FAULT
 } DriveState;
@@ -96,6 +97,7 @@ typedef struct {
     int32_t pwmSlewPerTick;
     int32_t kp;
     int32_t kd;
+    uint32_t startAccelMs;
     uint32_t timeoutMs;
     bool stableSupervisor;
     bool finishEnabled;
@@ -108,18 +110,33 @@ static const DriveProfile gQ2DriveProfile = {
     .pwmSlewPerTick = APP_Q2_TRACK_PWM_SLEW_PER_TICK,
     .kp = APP_Q2_LINE_PID_KP,
     .kd = APP_Q2_LINE_PID_KD,
+    .startAccelMs = 0U,
     .timeoutMs = APP_Q2_RUN_TIMEOUT_MS,
     .stableSupervisor = false,
     .finishEnabled = true,
     .stallStopEnabled = true
 };
 
-static const DriveProfile gQ456DriveProfile = {
+static const DriveProfile gQ4DriveProfile = {
     .basePwm = APP_Q456_TRACK_BASE_PWM,
     .finalPwm = APP_Q456_TRACK_FINAL_PWM,
     .pwmSlewPerTick = APP_Q456_TRACK_PWM_SLEW_PER_TICK,
     .kp = APP_Q456_LINE_PID_KP,
     .kd = APP_Q456_LINE_PID_KD,
+    .startAccelMs = APP_Q456_START_ACCEL_MS,
+    .timeoutMs = 0U,
+    .stableSupervisor = true,
+    .finishEnabled = false,
+    .stallStopEnabled = false
+};
+
+static const DriveProfile gQ56DriveProfile = {
+    .basePwm = APP_Q56_TRACK_BASE_PWM,
+    .finalPwm = APP_Q56_TRACK_FINAL_PWM,
+    .pwmSlewPerTick = APP_Q56_TRACK_PWM_SLEW_PER_TICK,
+    .kp = APP_Q56_LINE_PID_KP,
+    .kd = APP_Q56_LINE_PID_KD,
+    .startAccelMs = APP_Q56_START_ACCEL_MS,
     .timeoutMs = 0U,
     .stableSupervisor = true,
     .finishEnabled = false,
@@ -134,6 +151,7 @@ static uint32_t gRunStartMs;
 static uint32_t gFrozenElapsedMs;
 static uint32_t gLastOledUpdateMs;
 static uint32_t gStartMarkerClearMs;
+static uint32_t gFinishRunoutStartMs;
 static uint32_t gFaultLedLastToggleMs;
 static int32_t gStartEncoderA;
 static int32_t gStartEncoderB;
@@ -672,7 +690,8 @@ static void __attribute__((unused)) oled_service(void)
     } else if ((gDriveState == DRIVE_START_PRELOAD) ||
                (gDriveState == DRIVE_LEAVING_START) ||
                (gDriveState == DRIVE_TRACKING) ||
-               (gDriveState == DRIVE_FINAL_APPROACH)) {
+               (gDriveState == DRIVE_FINAL_APPROACH) ||
+               (gDriveState == DRIVE_FINISH_RUNOUT)) {
         shownMs = (uint32_t) (gMs - gRunStartMs);
     } else {
         shownMs = 0U;
@@ -1050,6 +1069,7 @@ static void reset_drive_controller(void)
     gCommandPwmA = 0U;
     gCommandPwmB = 0U;
     gFinishMarkerScans = 0U;
+    gFinishRunoutStartMs = gMs;
     gStartMarkerClearActive = false;
     gFinishArmed = false;
     gDriveStartPreloadMs = gMs;
@@ -1061,8 +1081,8 @@ static void reset_drive_controller(void)
 static float q456_start_accel_feedforward_target(void)
 {
     float plannedPwmDeltaPerTick =
-        ((float) gQ456DriveProfile.basePwm * (float) APP_CONTROL_TICK_MS) /
-        (float) APP_Q456_START_ACCEL_MS;
+        ((float) gDriveProfile->basePwm * (float) APP_CONTROL_TICK_MS) /
+        (float) gDriveProfile->startAccelMs;
     float feedforwardSteps;
 
     if (abs_float(plannedPwmDeltaPerTick) <=
@@ -1133,6 +1153,13 @@ static void update_finish_logic(uint8_t lineMask, uint32_t distance,
 {
     bool wideMarker = is_wide_marker(lineMask);
 
+    if (gDriveState == DRIVE_FINISH_RUNOUT) {
+        if (elapsed_ms(gFinishRunoutStartMs, APP_Q2_FINISH_RUNOUT_MS)) {
+            enter_complete();
+        }
+        return;
+    }
+
     if (gDriveState == DRIVE_LEAVING_START) {
         if (!wideMarker) {
             if (!gStartMarkerClearActive) {
@@ -1171,7 +1198,9 @@ static void update_finish_logic(uint8_t lineMask, uint32_t distance,
         }
         if (gFinishMarkerScans >= APP_MARKER_CONFIRM_SCANS) {
             gFinishMarkerScans = 0U;
-            enter_complete();
+            gFinishRunoutStartMs = gMs;
+            gDriveState = DRIVE_FINISH_RUNOUT;
+            gDisplayDirty = true;
         }
     } else {
         gFinishMarkerScans = 0U;
@@ -1206,15 +1235,16 @@ static void update_line_control(uint8_t lineMask)
      * brief line loss, freeze the last PID correction so the car continues
      * searching in the established direction without integral windup.
      */
-    basePwm = (gDriveState == DRIVE_FINAL_APPROACH) ?
+    basePwm = ((gDriveState == DRIVE_FINAL_APPROACH) ||
+        (gDriveState == DRIVE_FINISH_RUNOUT)) ?
         gDriveProfile->finalPwm : gDriveProfile->basePwm;
     correction = gLinePidCorrection;
 
     if (gDriveProfile->stableSupervisor) {
         profileElapsedMs = (uint32_t) (gMs - gDriveMotionStartMs);
-        if (profileElapsedMs < APP_Q456_START_ACCEL_MS) {
+        if (profileElapsedMs < gDriveProfile->startAccelMs) {
             basePwm = (int32_t) (((uint32_t) basePwm *
-                profileElapsedMs) / APP_Q456_START_ACCEL_MS);
+                profileElapsedMs) / gDriveProfile->startAccelMs);
             q456_service_start_accel_feedforward(true);
         } else {
             q456_service_start_accel_feedforward(false);
@@ -1239,14 +1269,16 @@ static bool drive_sequence_active(void)
     return (gDriveState == DRIVE_START_PRELOAD) ||
         (gDriveState == DRIVE_LEAVING_START) ||
         (gDriveState == DRIVE_TRACKING) ||
-        (gDriveState == DRIVE_FINAL_APPROACH);
+        (gDriveState == DRIVE_FINAL_APPROACH) ||
+        (gDriveState == DRIVE_FINISH_RUNOUT);
 }
 
 static bool drive_wheels_running(void)
 {
     return (gDriveState == DRIVE_LEAVING_START) ||
         (gDriveState == DRIVE_TRACKING) ||
-        (gDriveState == DRIVE_FINAL_APPROACH);
+        (gDriveState == DRIVE_FINAL_APPROACH) ||
+        (gDriveState == DRIVE_FINISH_RUNOUT);
 }
 
 static void drive_active_tick(void)
@@ -1270,6 +1302,7 @@ static void drive_active_tick(void)
 
     update_line_control(lineMask);
     if ((gDriveState != DRIVE_FAULT) &&
+        (gDriveState != DRIVE_FINISH_RUNOUT) &&
         (gDriveProfile->timeoutMs != 0U) &&
         (elapsed >= gDriveProfile->timeoutMs)) {
         enter_fault();
@@ -1340,7 +1373,7 @@ static void question5_tick_5ms(void)
         !drive_sequence_active()) {
         if (gAppMode == APP_Q4_BALL_AB) {
             if (gQuestion5BallStarted && ballReady) {
-                start_run(&gQ456DriveProfile);
+                start_run(&gQ4DriveProfile);
             }
         } else if (!gQuestion5BallStarted) {
             BallTargetCommand target = ball_protocol_get_target_command();
@@ -1358,7 +1391,7 @@ static void question5_tick_5ms(void)
             APP_Q56_DRIVE_DOUBLE_CLICK_MS) {
             gQuestion5DriveClickCount = 0U;
             if (ballReady) {
-                start_run(&gQ456DriveProfile);
+                start_run(&gQ56DriveProfile);
             }
         } else {
             gQuestion5DriveClickCount = 1U;
