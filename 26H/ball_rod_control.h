@@ -76,6 +76,7 @@ typedef struct {
 
 void ball_rod_init(uint32_t nowMs);
 void ball_rod_set_target_x_q4(uint16_t targetXQ4);
+bool ball_rod_enable_driver(uint32_t nowMs);
 bool ball_rod_start(uint32_t nowMs);
 void ball_rod_start_practice(uint32_t nowMs);
 void ball_rod_set_chassis_accel_compensation_steps(float steps);

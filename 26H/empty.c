@@ -1410,6 +1410,7 @@ static void enter_selected_mode(void)
     } else {
         gAppMode = APP_Q56_POS_TRACK;
         ball_protocol_set_enabled(true, gMs);
+        (void) ball_rod_enable_driver(gMs);
         gTargetSelectionAllowed = true;
         oled_show_small_message("CONFIRM POS?");
     }

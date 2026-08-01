@@ -29,7 +29,7 @@
 #define APP_Q2_LINE_PID_KP                        (5)
 #define APP_Q2_LINE_PID_KD                        (10)
 
-#define APP_Q456_TRACK_BASE_PWM                  (2250U)
+#define APP_Q456_TRACK_BASE_PWM                  (2300U)
 #define APP_Q456_TRACK_FINAL_PWM                 (1000U)
 #define APP_Q456_TRACK_PWM_SLEW_PER_TICK          (100)
 #define APP_Q456_LINE_PID_KP                      (8)

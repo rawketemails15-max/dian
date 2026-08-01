@@ -587,6 +587,17 @@ void ball_rod_set_target_x_q4(uint16_t targetXQ4)
     gTiltResidual = 0.0f;
 }
 
+bool ball_rod_enable_driver(uint32_t nowMs)
+{
+    if (gSafetyLatched) {
+        return false;
+    }
+
+    ball_stepper_enable(nowMs);
+    ball_stepper_hold();
+    return true;
+}
+
 bool ball_rod_start(uint32_t nowMs)
 {
     if (gSafetyLatched) {
