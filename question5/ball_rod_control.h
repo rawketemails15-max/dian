@@ -68,6 +68,7 @@ typedef struct {
     uint8_t armFrames;
     uint8_t event;
     uint8_t faultReason;
+    bool practiceActive;
     uint32_t crcErrors;
     uint32_t sequenceDrops;
     uint32_t rxOverflows;
@@ -75,8 +76,8 @@ typedef struct {
 
 void ball_rod_init(uint32_t nowMs);
 void ball_rod_set_target_x_q4(uint16_t targetXQ4);
-void ball_rod_set_chassis_accel_compensation_steps(float steps);
 bool ball_rod_start(uint32_t nowMs);
+void ball_rod_start_practice(uint32_t nowMs);
 void ball_rod_pause(void);
 void ball_rod_emergency_stop(void);
 void ball_rod_tick_5ms(

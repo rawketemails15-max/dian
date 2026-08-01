@@ -291,6 +291,16 @@ class DraggableTargetLine:
             self.display_width,
         )
 
+    def lock_to(self, target_x_q4):
+        self.target_x_q4 = int(clamp(
+            int(target_x_q4),
+            TARGET_MIN_X_Q4,
+            TARGET_MAX_X_Q4,
+        ))
+        self.state = self.STATE_IDLE
+        self.dragging = False
+        self.empty_frames = 0
+
     def update(self, points):
         changed = False
         committed = False
@@ -531,17 +541,20 @@ def print_startup_summary(pipeline, ap_ip, restart_count):
     print("模型:", MODEL_PATH)
     print("检测通道: 640x360 RGB888P -> 320x320 model")
     print("LCD: 800x480, 每个推理帧刷新OSD")
-    print(
-        "RTSP: rtsp://%s:%d/%s (%dx%d @ %d FPS)"
-        % (
-            ap_ip,
-            platform.RTSP_PORT,
-            platform.RTSP_SESSION,
-            pipeline.video_width,
-            pipeline.video_height,
-            platform.VIDEO_FPS,
+    if pipeline.network_enabled:
+        print(
+            "RTSP: rtsp://%s:%d/%s (%dx%d @ %d FPS)"
+            % (
+                ap_ip,
+                platform.RTSP_PORT,
+                platform.RTSP_SESSION,
+                pipeline.video_width,
+                pipeline.video_height,
+                platform.VIDEO_FPS,
+            )
         )
-    )
+    else:
+        print("RTSP: OFFLINE (LCD/AI/UART remain active)")
     print("UART1: IO3 TX / IO4 RX / 115200 8N1")
     print("目标默认X=%d, 媒体重建次数=%d" % (
         TARGET_DEFAULT_X,
@@ -592,7 +605,22 @@ def run_media_loop(
         # Touch target -> status RX -> target TX -> vision TX -> UDP.
         stage_started_us = time.ticks_us()
         now_ms = time.ticks_ms()
+        uart_sender.poll_status()
+        target_locked = uart_sender.target_locked()
+        target_selection_allowed = (
+            uart_sender.target_selection_allowed()
+        )
         if (
+            target_locked
+            and uart_sender.status_parser.target_x_q4 is not None
+        ):
+            target_line.lock_to(
+                uart_sender.status_parser.target_x_q4
+            )
+        if (
+            target_selection_allowed
+            and not target_locked
+            and
             touch_state[0] is None
             and time.ticks_diff(now_ms, touch_state[1]) >= TOUCH_RETRY_MS
         ):
@@ -600,7 +628,11 @@ def run_media_loop(
             touch_state[1] = now_ms
 
         points = ()
-        if touch_state[0] is not None:
+        if (
+            target_selection_allowed
+            and not target_locked
+            and touch_state[0] is not None
+        ):
             try:
                 points = touch_state[0].read(1)
             except Exception as error:
@@ -608,7 +640,11 @@ def run_media_loop(
                 touch_state[0] = None
                 touch_state[1] = now_ms
 
-        target_changed, target_committed = target_line.update(points)
+        target_changed, target_committed = (
+            target_line.update(points)
+            if target_selection_allowed and not target_locked
+            else (False, False)
+        )
         if target_changed:
             uart_sender.set_target(target_line.target_x_q4)
         if target_committed:
@@ -617,7 +653,6 @@ def run_media_loop(
                 force=True,
             )
 
-        uart_sender.poll_status()
         uart_sender.service_target(force=target_committed)
         uart_sender.send(motion)
         udp_sender.send(motion)
@@ -669,10 +704,15 @@ def main():
     # This is the only platform global changed at runtime: channel 2 must
     # match the V2 detector. The fallback file itself remains untouched.
     platform.AI_FRAME_SIZE = DETECTION_SIZE
+    platform.VIDEO_WIDTH = 1280
+    platform.VIDEO_HEIGHT = 720
+    platform.VIDEO_BIT_RATE = 2500
+
 
     target_line = DraggableTargetLine(TARGET_DEFAULT_X * 16)
     touch_state = [None, time.ticks_ms() - TOUCH_RETRY_MS]
     restart_count = 0
+    network_allowed = False
 
     try:
         print("=" * 60)
@@ -684,7 +724,16 @@ def main():
         print("V2模型:", MODEL_PATH, "bytes=", model_info[6])
 
         time.sleep_ms(platform.BOOT_SETTLE_MS)
-        ap, ap_ip = platform.start_ap()
+        try:
+            ap, ap_ip = platform.start_ap()
+        except BaseException as error:
+            ap = None
+            ap_ip = "0.0.0.0"
+            platform.show_exception(error, "Wi-Fi旁路")
+            platform.log_event(
+                "Wi-Fi/RTSP启动失败，本次上电仅运行LCD/AI/UART"
+            )
+        network_allowed = ap is not None
         udp_sender = platform.UdpBallSender(ap_ip)
         uart_sender = platform.BallUartSender()
         uart_sender.set_target(target_line.target_x_q4, force=True)
@@ -693,8 +742,12 @@ def main():
 
         while True:
             try:
-                pipeline = platform.CombinedMediaPipeline()
+                pipeline = platform.CombinedMediaPipeline(
+                    enable_network=network_allowed
+                )
                 pipeline.start()
+                if not pipeline.network_enabled:
+                    network_allowed = False
                 yolo = create_yolo()
                 uart_sender.request_target_resend()
                 pipeline.poll_rtsp_client(ap)
@@ -718,6 +771,13 @@ def main():
                 platform.show_exception(error, "li.py媒体循环")
                 restart_count += 1
             finally:
+                if (
+                    pipeline is not None
+                    and not pipeline.network_enabled
+                ):
+                    # An optional-network failure is sticky for this boot;
+                    # later camera/KPU recovery must not retry Wi-Fi/VENC.
+                    network_allowed = False
                 if pipeline is not None:
                     try:
                         pipeline.stop_stream_thread()

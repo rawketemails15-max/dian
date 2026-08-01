@@ -7,6 +7,19 @@
 #define BALL_VISION_FLAG_PREDICTED (0x02U)
 #define FLOAT_TWO_PI                (6.2831853f)
 
+/* Chassis acceleration feed-forward (retained from parent project). */
+#define APP_Q5_BALL_ACCEL_COMP_LIMIT_STEPS (32.0f)
+
+typedef enum {
+    BALL_PRACTICE_IDLE = 0,
+    BALL_PRACTICE_TO_POS5,
+    BALL_PRACTICE_SETTLED_POS5,
+    BALL_PRACTICE_TO_NEG5,
+    BALL_PRACTICE_SETTLED_NEG5,
+    BALL_PRACTICE_COMPLETE,
+    BALL_PRACTICE_TIMEOUT
+} BallPracticePhase;
+
 static BallRodTelemetry gTelemetry;
 static uint16_t gTargetXQ4;
 static uint16_t gLastVisionSequence;
@@ -21,6 +34,7 @@ static float gContinuousTilt;
 static float gTiltResidual;
 static float gFrictionBoost;
 static float gChassisAccelCompensation;
+static float gIntegral;
 static uint8_t gStuckFrames;
 static bool gHoldLatched;
 static bool gRunRequested;
@@ -33,6 +47,10 @@ static bool gButtonStable;
 static bool gButtonEmergencyHandled;
 static uint32_t gButtonRawChangedMs;
 static uint32_t gButtonPressedMs;
+static BallPracticePhase gPracticePhase;
+static uint32_t gPracticeStartMs;
+static uint32_t gPracticeTargetSettledMs;
+static float gPracticeBalanceTilt;
 #if APP_BALL_CALIBRATION_MODE
 static bool gCalibrationClickPending;
 static uint32_t gCalibrationFirstClickMs;
@@ -101,6 +119,7 @@ static void reset_control_history(int32_t currentSteps, uint32_t nowMs)
     gContinuousTilt = (float) currentSteps;
     gTiltResidual = 0.0f;
     gFrictionBoost = 0.0f;
+    gIntegral = 0.0f;
     gStuckFrames = 0U;
     gHoldLatched = false;
 }
@@ -209,12 +228,8 @@ static void service_button(uint32_t nowMs, bool pressed)
         }
     }
 
-    if (gButtonStable && !gButtonEmergencyHandled &&
-        ((uint32_t) (nowMs - gButtonPressedMs) >=
-            APP_BALL_BUTTON_ESTOP_MS)) {
-        gButtonEmergencyHandled = true;
-        emergency_stop();
-    }
+    /* 2 s emergency stop disabled in Q5 mode. */
+    (void)emergency_stop;
 
 #if APP_BALL_CALIBRATION_MODE
     if (gCalibrationClickPending &&
@@ -382,6 +397,7 @@ static void update_controller_from_real_frame(
     if (!gHoldLatched && enterHold) {
         gHoldLatched = true;
         gFrictionBoost = 0.0f;
+        gIntegral = 0.0f;
         gTiltResidual = 0.0f;
         gStuckFrames = 0U;
         publish_event(BALL_STATUS_EVENT_CENTER_SETTLED);
@@ -394,6 +410,7 @@ static void update_controller_from_real_frame(
         gTelemetry.state = BALL_ROD_HOLD;
         gTelemetry.motionPhase = BALL_MOTION_LEVELING;
         gFrictionBoost = 0.0f;
+        gIntegral = 0.0f;
         gTiltResidual = 0.0f;
         gStuckFrames = 0U;
         command_continuous_tilt(
@@ -403,12 +420,43 @@ static void update_controller_from_real_frame(
 
     gTelemetry.state = BALL_ROD_ACTIVE;
     gTelemetry.motionPhase = BALL_MOTION_CORRECTING;
-    desiredTilt = (float) APP_BALL_POSITION_TO_TILT_SIGN *
-        (APP_BALL_POSITION_KP * errorPixels -
-            APP_BALL_POSITION_KD * gFilteredVelocity);
-    desiredTilt = apply_rough_tube_compensation(desiredTilt, errorQ4);
-    desiredTilt += gChassisAccelCompensation;
-    command_continuous_tilt(desiredTilt, false);
+
+    /*
+     * Continuous PD — 4 个锚点线性插值。
+     *
+     *   锚点  |E|:    0      5      15     40     (px)
+     *          KP:  0.030  0.080  0.120  0.200
+     *          KD:  0.015  0.044  0.066  0.120
+     *     KD/KP:  0.50   0.55   0.55   0.60
+     */
+    {
+        float absErrPx = abs_float(errorPixels);
+        float kp, kd;
+
+        if (absErrPx <= 5.0f) {
+            float t = absErrPx / 5.0f;
+            kp = 0.030f + t * 0.050f;  /* 0.030 → 0.080 */
+            kd = 0.015f + t * 0.029f;  /* 0.015 → 0.044 */
+        } else if (absErrPx <= 15.0f) {
+            float t = (absErrPx - 5.0f) / 10.0f;
+            kp = 0.080f + t * 0.040f;  /* 0.080 → 0.120 */
+            kd = 0.044f + t * 0.022f;  /* 0.044 → 0.066 */
+        } else if (absErrPx <= 40.0f) {
+            float t = (absErrPx - 15.0f) / 25.0f;
+            kp = 0.120f + t * 0.080f;  /* 0.120 → 0.200 */
+            kd = 0.066f + t * 0.054f;  /* 0.066 → 0.120 */
+        } else {
+            kp = 0.200f;
+            kd = 0.120f;
+        }
+
+        desiredTilt = (float) APP_BALL_POSITION_TO_TILT_SIGN *
+            (kp * errorPixels - kd * gFilteredVelocity);
+        desiredTilt = apply_rough_tube_compensation(
+            desiredTilt, errorQ4);
+        desiredTilt += gChassisAccelCompensation;
+        command_continuous_tilt(desiredTilt, false);
+    }
 }
 
 static void update_telemetry(
@@ -442,6 +490,8 @@ static void update_telemetry(
     gTelemetry.tiltLimit = APP_BALL_WORK_TILT_LIMIT_STEPS;
     gTelemetry.armFrames = gRealArmFrames;
     gTelemetry.centerSettled = gHoldLatched;
+    gTelemetry.practiceActive =
+        (gPracticePhase != BALL_PRACTICE_IDLE);
     gTelemetry.mustCorrect =
         abs_i32(gTelemetry.ballErrorQ4) >
             APP_BALL_HOLD_ENTER_ERROR_Q4;
@@ -481,6 +531,7 @@ void ball_rod_init(uint32_t nowMs)
     gTiltResidual = 0.0f;
     gFrictionBoost = 0.0f;
     gChassisAccelCompensation = 0.0f;
+    gIntegral = 0.0f;
     gStuckFrames = 0U;
     gHoldLatched = false;
     gRunRequested = false;
@@ -492,6 +543,10 @@ void ball_rod_init(uint32_t nowMs)
     gButtonEmergencyHandled = false;
     gButtonRawChangedMs = nowMs;
     gButtonPressedMs = nowMs;
+    gPracticePhase = BALL_PRACTICE_IDLE;
+    gPracticeStartMs = nowMs;
+    gPracticeTargetSettledMs = 0U;
+    gPracticeBalanceTilt = 0.0f;
 #if APP_BALL_CALIBRATION_MODE
     gCalibrationClickPending = false;
     gCalibrationFirstClickMs = nowMs;
@@ -523,6 +578,7 @@ void ball_rod_set_target_x_q4(uint16_t targetXQ4)
     }
     gHoldLatched = false;
     gFrictionBoost = 0.0f;
+    gIntegral = 0.0f;
     gTiltResidual = 0.0f;
 }
 
@@ -535,6 +591,26 @@ bool ball_rod_start(uint32_t nowMs)
     gRunRequested = true;
     enter_waiting_vision(nowMs);
     return true;
+}
+
+void ball_rod_start_practice(uint32_t nowMs)
+{
+    if (gSafetyLatched) {
+        return;
+    }
+    if (!gRunRequested) {
+        gRunRequested = true;
+        enter_waiting_vision(nowMs);
+    }
+    gPracticePhase = BALL_PRACTICE_TO_POS5;
+    gPracticeStartMs = nowMs;
+    gPracticeTargetSettledMs = nowMs;
+    gPracticeBalanceTilt = gContinuousTilt;
+    gHoldLatched = false;
+    gFrictionBoost = 0.0f;
+    gIntegral = 0.0f;
+    ball_rod_set_target_x_q4(APP_BALL_PRACTICE_TARGET_POS5_Q4);
+    publish_event(BALL_STATUS_EVENT_CORRECTION_RESUME);
 }
 
 void ball_rod_set_chassis_accel_compensation_steps(float steps)
@@ -576,6 +652,30 @@ void ball_rod_tick_5ms(
 #if !APP_BALL_CALIBRATION_MODE
     if (realValidFrame) {
         update_controller_from_real_frame(nowMs, vision);
+    }
+
+    /* Practice mode: timed open-loop sequence. */
+    if (gRunRequested && gPracticePhase != BALL_PRACTICE_IDLE) {
+        float practiceTilt;
+        uint32_t phaseElapsed =
+            (uint32_t)(nowMs - gPracticeTargetSettledMs);
+
+        if (gPracticePhase == BALL_PRACTICE_TO_POS5) {
+            practiceTilt = gPracticeBalanceTilt + 50.0f;
+            if (phaseElapsed >= 1000U) {
+                gPracticePhase = BALL_PRACTICE_TO_NEG5;
+                gPracticeTargetSettledMs = nowMs;
+            }
+        } else if (gPracticePhase == BALL_PRACTICE_TO_NEG5) {
+            practiceTilt = gPracticeBalanceTilt - 33.0f;
+            if (phaseElapsed >= 2000U) {
+                gPracticePhase = BALL_PRACTICE_SETTLED_NEG5;
+                gPracticeTargetSettledMs = nowMs;
+            }
+        } else {
+            practiceTilt = gPracticeBalanceTilt;
+        }
+        command_continuous_tilt(practiceTilt, false);
     }
 
     if (gRunRequested &&

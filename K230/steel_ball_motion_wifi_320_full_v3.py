@@ -47,7 +47,7 @@ mm = None
 
 AP_SSID = "K230_AP"
 AP_PASSWORD = "12345678"
-AP_READY_TIMEOUT_MS = 10000
+AP_READY_TIMEOUT_MS = 2000
 AP_POLL_INTERVAL_MS = 200
 BOOT_SETTLE_MS = 3000
 AP_CLIENT_POLL_MS = 250
@@ -98,12 +98,12 @@ elif RTSP_LOW_LATENCY_PRESET == 2:
 else:
     raise ValueError("RTSP_LOW_LATENCY_PRESET必须是0、1或2")
 
-# Sensor/KPU继续以30 FPS运行；只让VENC按VIDEO_FPS抽帧，
-# 避免为了图传降帧而降低钢珠识别和UART控制频率。
-SENSOR_FPS = 30
+# Sensor/KPU继续按 60 FPS运行；只让VENC按VIDEO_FPS抽帧。
+# 以为图传节省带宽，但不影响识别和UART控制。
+SENSOR_FPS = 60
 
 GET_STREAM_TIMEOUT_MS = 200
-FIRST_FRAME_TIMEOUT_MS = 6000
+FIRST_FRAME_TIMEOUT_MS = 2000
 STREAM_STALL_TIMEOUT_MS = 5000
 HEALTH_PRINT_INTERVAL_MS = 2000
 THREAD_STOP_TIMEOUT_MS = 3000
@@ -163,17 +163,20 @@ UDP_PORT = 9000
 UART_TX_IO = 3
 UART_RX_IO = 4
 UART_BAUD_RATE = 115200
-UART_SEND_INTERVAL_MS = 33
+UART_SEND_INTERVAL_MS = 16
 UART_PROTOCOL_VERSION = 0x01
 UART_MESSAGE_BALL_X = 0x03
 UART_MESSAGE_TARGET_X = 0x04
 UART_MESSAGE_STATUS = 0x83
 UART_STATUS_PAYLOAD_SIZE = 45
 UART_STATUS_FRAME_SIZE = 52
-UART_TARGET_SEND_INTERVAL_MS = 33
+UART_TARGET_SEND_INTERVAL_MS = 16
 UART_TARGET_RETRY_MS = 100
 UART_TARGET_HEARTBEAT_MS = 500
 UART_STATUS_STALE_MS = 300
+UART_INTERBYTE_TIMEOUT_MS = 20
+UART_STATUS_FLAG_TARGET_SELECT = 1 << 9
+UART_STATUS_FLAG_TARGET_LOCKED = 1 << 10
 
 BALL_TARGET_DEFAULT_X = 171
 BALL_TARGET_DEFAULT_X_Q4 = BALL_TARGET_DEFAULT_X * 16
@@ -645,8 +648,11 @@ class MspStatusParser:
         self.crc_errors = 0
         self.format_errors = 0
         self.sequence = 0
+        self.flags = 0
         self.target_x_q4 = None
         self.last_status_ms = 0
+        self.last_byte_ms = 0
+        self.timeout_resets = 0
 
     def _resync(self, value=0):
         if value == 0xA5:
@@ -659,8 +665,18 @@ class MspStatusParser:
         if not data:
             return
 
+        if (
+            self.index
+            and self.last_byte_ms
+            and time.ticks_diff(now_ms, self.last_byte_ms)
+            >= UART_INTERBYTE_TIMEOUT_MS
+        ):
+            self.timeout_resets += 1
+            self._resync()
+
         for value in data:
             self.raw_bytes += 1
+            self.last_byte_ms = now_ms
             if self.index == 0:
                 if value == 0xA5:
                     self.frame[0] = value
@@ -700,6 +716,10 @@ class MspStatusParser:
                     self.sequence = (
                         self.frame[5]
                         | (self.frame[6] << 8)
+                    )
+                    self.flags = (
+                        self.frame[15]
+                        | (self.frame[16] << 8)
                     )
                     self.target_x_q4 = (
                         self.frame[41]
@@ -846,6 +866,8 @@ class BallUartSender:
         self._write_frame(frame)
 
     def set_target(self, target_x_q4, force=False):
+        if self.target_locked():
+            return
         target_x_q4 = clamp_integer(
             int(target_x_q4),
             BALL_TARGET_MIN_X_Q4,
@@ -889,6 +911,26 @@ class BallUartSender:
             return False
         return parser.target_x_q4 == self.requested_target_x_q4
 
+    def target_selection_allowed(self):
+        parser = self.status_parser
+        return bool(
+            parser.last_status_ms
+            and time.ticks_diff(time.ticks_ms(), parser.last_status_ms)
+            <= UART_STATUS_STALE_MS
+            and parser.flags
+            & UART_STATUS_FLAG_TARGET_SELECT
+        )
+
+    def target_locked(self):
+        parser = self.status_parser
+        return bool(
+            parser.last_status_ms
+            and time.ticks_diff(time.ticks_ms(), parser.last_status_ms)
+            <= UART_STATUS_STALE_MS
+            and parser.flags
+            & UART_STATUS_FLAG_TARGET_LOCKED
+        )
+
     def target_ack_text(self, now_ms=None):
         if now_ms is None:
             now_ms = time.ticks_ms()
@@ -907,12 +949,26 @@ class BallUartSender:
             > UART_STATUS_STALE_MS
         ):
             return "LINK LOST"
+        if self.target_locked():
+            return "LOCKED"
         if parser.target_x_q4 == self.requested_target_x_q4:
             return "ACK"
         return "WAIT"
 
     def service_target(self, force=False):
         now_ms = time.ticks_ms()
+        if self.target_locked():
+            if self.status_parser.target_x_q4 is not None:
+                self.requested_target_x_q4 = (
+                    self.status_parser.target_x_q4
+                )
+            self.target_pending = False
+            self.target_force = False
+            return
+        if not self.target_selection_allowed():
+            # Keep the pending target locally.  It will be sent immediately
+            # after the MCU opens a fresh Q5/6 selection session.
+            return
         if force:
             self.target_pending = True
             self.target_force = True
@@ -1457,20 +1513,38 @@ class CombinedMediaPipeline:
     def __init__(
         self,
         session_name=RTSP_SESSION,
-        port=RTSP_PORT
+        port=RTSP_PORT,
+        enable_network=True
     ):
-        ensure_multimedia_loaded()
+        self.network_enabled = bool(enable_network)
+        if self.network_enabled:
+            try:
+                ensure_multimedia_loaded()
+            except Exception as error:
+                self.network_enabled = False
+                print("网络媒体模块不可用，继续LCD/AI/UART:", error)
 
         self.session_name = session_name
         self.port = port
-        self.video_type = mm.multi_media_type.media_h264
+        self.video_type = (
+            mm.multi_media_type.media_h264
+            if self.network_enabled
+            else None
+        )
         self.enable_audio = False
 
         self.video_width = ALIGN_UP(VIDEO_WIDTH, 16)
         self.video_height = VIDEO_HEIGHT
         self.venc_chn = VENC_CHN_ID_0
 
-        self.rtsp_server = mm.rtsp_server()
+        self.rtsp_server = None
+        if self.network_enabled:
+            try:
+                self.rtsp_server = mm.rtsp_server()
+            except Exception as error:
+                self.network_enabled = False
+                self.video_type = None
+                print("RTSP服务不可用，继续LCD/AI/UART:", error)
         self.sensor = None
         self.encoder = None
         self.encoder_link = None
@@ -1563,17 +1637,18 @@ class CombinedMediaPipeline:
             layer=Display.LAYER_VIDEO1
         )
 
-        # 通道1只负责原始画面硬件编码，不经过OSD。
-        self.sensor.set_framesize(
-            width=self.video_width,
-            height=self.video_height,
-            chn=CAM_CHN_ID_1,
-            alignment=12
-        )
-        self.sensor.set_pixformat(
-            PIXEL_FORMAT_YUV_SEMIPLANAR_420,
-            chn=CAM_CHN_ID_1
-        )
+        # 通道1仅在网络图传可用时启用。
+        if self.network_enabled:
+            self.sensor.set_framesize(
+                width=self.video_width,
+                height=self.video_height,
+                chn=CAM_CHN_ID_1,
+                alignment=12
+            )
+            self.sensor.set_pixformat(
+                PIXEL_FORMAT_YUV_SEMIPLANAR_420,
+                chn=CAM_CHN_ID_1
+            )
 
         # 通道2只负责KPU输入。
         self.sensor.set_framesize(
@@ -1592,25 +1667,32 @@ class CombinedMediaPipeline:
             image.ARGB8888
         )
 
-        print("正在初始化H.264编码器……")
-        self.encoder = Encoder()
-        self.encoder.SetOutBufs(
-            self.venc_chn,
-            VENC_BUFFER_COUNT,
-            self.video_width,
-            self.video_height
-        )
+        if self.network_enabled:
+            try:
+                print("正在初始化H.264编码器……")
+                self.encoder = Encoder()
+                self.encoder.SetOutBufs(
+                    self.venc_chn,
+                    VENC_BUFFER_COUNT,
+                    self.video_width,
+                    self.video_height
+                )
 
-        self.encoder_link = MediaManager.link(
-            self.sensor.bind_info(
-                chn=CAM_CHN_ID_1
-            )["src"],
-            (
-                VIDEO_ENCODE_MOD_ID,
-                VENC_DEV_ID,
-                self.venc_chn
-            )
-        )
+                self.encoder_link = MediaManager.link(
+                    self.sensor.bind_info(
+                        chn=CAM_CHN_ID_1
+                    )["src"],
+                    (
+                        VIDEO_ENCODE_MOD_ID,
+                        VENC_DEV_ID,
+                        self.venc_chn
+                    )
+                )
+            except Exception as error:
+                self.network_enabled = False
+                self.encoder = None
+                self.encoder_link = None
+                print("VENC初始化失败，继续LCD/AI/UART:", error)
 
         print("正在初始化媒体缓冲区……")
         MediaManager.init()
@@ -1630,22 +1712,30 @@ class CombinedMediaPipeline:
         )
         print("LCD OSD显示与旋转缓冲区预留完成")
 
-        encoder_attribute = ChnAttrStr(
-            self.encoder.PAYLOAD_TYPE_H264,
-            self.encoder.H264_PROFILE_BASELINE,
-            self.video_width,
-            self.video_height,
-            VIDEO_BIT_RATE,
-            VIDEO_GOP,
-            SENSOR_FPS,
-            VIDEO_FPS
-        )
+        if self.network_enabled:
+            try:
+                encoder_attribute = ChnAttrStr(
+                    self.encoder.PAYLOAD_TYPE_H264,
+                    self.encoder.H264_PROFILE_BASELINE,
+                    self.video_width,
+                    self.video_height,
+                    VIDEO_BIT_RATE,
+                    VIDEO_GOP,
+                    SENSOR_FPS,
+                    VIDEO_FPS
+                )
 
-        self.encoder.Create(
-            self.venc_chn,
-            encoder_attribute
-        )
-        self.encoder_created = True
+                self.encoder.Create(
+                    self.venc_chn,
+                    encoder_attribute
+                )
+                self.encoder_created = True
+            except Exception as error:
+                self.network_enabled = False
+                self.encoder_created = False
+                self.encoder = None
+                self.encoder_link = None
+                print("VENC创建失败，继续LCD/AI/UART:", error)
 
         print("三通道媒体管线配置完成")
         print(
@@ -1685,8 +1775,37 @@ class CombinedMediaPipeline:
 
         print("RTSP服务启动完成")
 
+    def _disable_optional_network(self, reason):
+        """Permanently bypass Wi-Fi/VENC/RTSP for this power cycle."""
+        if self.network_enabled:
+            print("网络图传已禁用，LCD、AI和UART继续运行:", reason)
+            log_event("网络图传已禁用: %s" % reason)
+
+        self.network_enabled = False
+        self.rtsp_feed_enabled = False
+        self.start_stream = False
+
+        if self.stream_thread_started and not self.runthread_over:
+            self._wait_stream_thread(GET_STREAM_TIMEOUT_MS + 100)
+
+        if self.encoder_started and self.encoder is not None:
+            try:
+                self.encoder.Stop(self.venc_chn)
+            except Exception:
+                pass
+            self.encoder_started = False
+
+        if self.rtsp_started and self.rtsp_server is not None:
+            try:
+                self.rtsp_server.rtspserver_stop()
+            except Exception:
+                pass
+            self.rtsp_started = False
+
     def poll_rtsp_client(self, ap):
         """Non-blocking AP-client gate for RTSP while vision keeps running."""
+        if not self.network_enabled or ap is None:
+            return False
         now_ms = time.ticks_ms()
 
         if (
@@ -1721,9 +1840,13 @@ class CombinedMediaPipeline:
                     self.rtsp_wait_started_ms
                 )
                 >= AP_STATUS_FALLBACK_SETTLE_MS
-            ):
+                ):
                 if not self.rtsp_started:
-                    self._start_rtsp_server()
+                    try:
+                        self._start_rtsp_server()
+                    except Exception as error:
+                        self._disable_optional_network(error)
+                        return False
                 self.rtsp_feed_enabled = True
                 print("RTSP兼容模式已启用，从当前编码帧开始发送")
                 log_event("RTSP兼容模式已启用，从当前编码帧开始发送")
@@ -1770,7 +1893,11 @@ class CombinedMediaPipeline:
             return False
 
         if not self.rtsp_started:
-            self._start_rtsp_server()
+            try:
+                self._start_rtsp_server()
+            except Exception as error:
+                self._disable_optional_network(error)
+                return False
 
         # Set this only after the RTSP session is completely ready. The
         # encoder thread cannot feed a half-initialized network service.
@@ -1786,15 +1913,22 @@ class CombinedMediaPipeline:
         return True
 
     def _start_media_stream(self):
-        print("正在启动H.264编码器……")
-        self.encoder.Start(self.venc_chn)
-        self.encoder_started = True
+        if self.network_enabled:
+            print("正在启动H.264编码器……")
+            try:
+                self.encoder.Start(self.venc_chn)
+                self.encoder_started = True
+            except Exception as error:
+                self._disable_optional_network(error)
 
         print("正在启动摄像头……")
         self.sensor.run()
         self.sensor_started = True
 
-        print("摄像头、LCD和编码器启动完成")
+        print(
+            "摄像头、LCD和%s启动完成"
+            % ("编码器" if self.network_enabled else "AI")
+        )
 
     def start(self):
         if self.server_started:
@@ -1829,13 +1963,27 @@ class CombinedMediaPipeline:
             self._configure_media()
             self._start_media_stream()
 
-            self.start_stream = True
-            self.stream_thread_started = True
+            if not self.network_enabled:
+                self.first_frame_ready = True
+                self.server_started = True
+                self.runthread_over = True
+                print("网络图传已旁路；LCD、AI和UART继续运行")
+                return
 
-            _thread.start_new_thread(
-                self._stream_thread,
-                ()
-            )
+            self.start_stream = True
+
+            try:
+                _thread.start_new_thread(
+                    self._stream_thread,
+                    ()
+                )
+                self.stream_thread_started = True
+            except Exception as error:
+                self._disable_optional_network(error)
+                self.first_frame_ready = True
+                self.server_started = True
+                self.runthread_over = True
+                return
 
             wait_started_ms = time.ticks_ms()
 
@@ -1846,7 +1994,10 @@ class CombinedMediaPipeline:
                     if not detail:
                         detail = "编码线程提前退出"
 
-                    raise RuntimeError(detail)
+                    self._disable_optional_network(detail)
+                    self.first_frame_ready = True
+                    self.server_started = True
+                    return
 
                 if (
                     time.ticks_diff(
@@ -1855,14 +2006,17 @@ class CombinedMediaPipeline:
                     )
                     >= FIRST_FRAME_TIMEOUT_MS
                 ):
-                    raise RuntimeError(
-                        "%dms内没有取得H.264首帧，"
-                        "GetStream失败次数=%d"
+                    detail = (
+                        "%dms内没有取得H.264首帧，GetStream失败次数=%d"
                         % (
                             FIRST_FRAME_TIMEOUT_MS,
                             self.get_stream_failures
                         )
                     )
+                    self._disable_optional_network(detail)
+                    self.first_frame_ready = True
+                    self.server_started = True
+                    return
 
                 time.sleep_ms(50)
 
@@ -2143,14 +2297,19 @@ class CombinedMediaPipeline:
         )
 
     def health_error(self):
+        if not self.network_enabled:
+            return None
         if self.thread_error:
-            return self.thread_error
+            self._disable_optional_network(self.thread_error)
+            return None
 
         if self.stream_thread_started and self.runthread_over:
-            return "编码线程已经退出"
+            self._disable_optional_network("编码线程已经退出")
+            return None
 
         if not self.first_frame_ready:
-            return "尚未取得H.264首帧"
+            self._disable_optional_network("尚未取得H.264首帧")
+            return None
 
         if self.last_stream_ms:
             silent_ms = time.ticks_diff(
@@ -2159,10 +2318,10 @@ class CombinedMediaPipeline:
             )
 
             if silent_ms > STREAM_STALL_TIMEOUT_MS:
-                return (
-                    "编码码流已中断%dms"
-                    % silent_ms
+                self._disable_optional_network(
+                    "编码码流已中断%dms" % silent_ms
                 )
+                return None
 
         return None
 

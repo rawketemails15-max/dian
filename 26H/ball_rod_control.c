@@ -1,31 +1,69 @@
 #include "ball_rod_control.h"
 
 #include "app_config.h"
+#include "ball_stepper.h"
 #include "ti_msp_dl_config.h"
 
-#include <limits.h>
+#define BALL_VISION_FLAG_PREDICTED (0x02U)
+#define FLOAT_TWO_PI                (6.2831853f)
 
-static volatile int32_t gCurrentSteps;
-static volatile int32_t gTargetSteps;
-static volatile bool gStepRunning;
-static volatile int8_t gStepSign;
+typedef enum {
+    BALL_PRACTICE_IDLE = 0,
+    BALL_PRACTICE_TO_POS5,
+    BALL_PRACTICE_SETTLED_POS5,
+    BALL_PRACTICE_TO_NEG5,
+    BALL_PRACTICE_SETTLED_NEG5,
+    BALL_PRACTICE_COMPLETE,
+    BALL_PRACTICE_TIMEOUT
+} BallPracticePhase;
 
 static BallRodTelemetry gTelemetry;
-static uint16_t gStepFrequencyHz;
-static uint16_t gCommandFrequencyHz;
+static uint16_t gTargetXQ4;
 static uint16_t gLastVisionSequence;
 static bool gHaveVisionSequence;
-static uint32_t gEnableStartMs;
-static bool gDriverEnabled;
+static bool gHaveRealVision;
+static uint32_t gLastRealVisionMs;
+static uint32_t gRunRequestMs;
+static uint32_t gLastOuterUpdateMs;
+static uint8_t gRealArmFrames;
+static float gFilteredVelocity;
+static float gContinuousTilt;
+static float gTiltResidual;
+static float gFrictionBoost;
+static float gChassisAccelCompensation;
+static float gIntegral;
+static uint8_t gStuckFrames;
+static bool gHoldLatched;
+static bool gRunRequested;
+static bool gSafetyLatched;
+static int32_t gMinimumReached;
+static int32_t gMaximumReached;
 
 static bool gButtonRaw;
 static bool gButtonStable;
 static bool gButtonEmergencyHandled;
 static uint32_t gButtonRawChangedMs;
 static uint32_t gButtonPressedMs;
-static bool gCalibrationPositiveDirection = true;
+static BallPracticePhase gPracticePhase;
+static uint32_t gPracticeStartMs;
+static uint32_t gPracticeTargetSettledMs;
+static float gPracticeBalanceTilt;
+#if APP_BALL_CALIBRATION_MODE
+static bool gCalibrationClickPending;
+static uint32_t gCalibrationFirstClickMs;
+#endif
 
-static int32_t clamp_i32(int32_t value, int32_t minimum, int32_t maximum)
+static float abs_float(float value)
+{
+    return (value < 0.0f) ? -value : value;
+}
+
+static int32_t abs_i32(int32_t value)
+{
+    return (value < 0) ? -value : value;
+}
+
+static float clamp_float(float value, float minimum, float maximum)
 {
     if (value < minimum) {
         return minimum;
@@ -36,353 +74,633 @@ static int32_t clamp_i32(int32_t value, int32_t minimum, int32_t maximum)
     return value;
 }
 
-static uint32_t absolute_i32(int32_t value)
+static float move_toward(float current, float target, float maximumDelta)
 {
-    return (uint32_t) ((value < 0) ? -value : value);
-}
+    float delta = target - current;
 
-static bool elapsed_ms(uint32_t nowMs, uint32_t startMs, uint32_t durationMs)
-{
-    return (uint32_t) (nowMs - startMs) >= durationMs;
-}
-
-static void step_pin_gpio_low(void)
-{
-    DL_TimerG_stopCounter(PWM_BALL_STEP_INST);
-    DL_GPIO_initDigitalOutput(GPIO_PWM_BALL_STEP_C1_IOMUX);
-    DL_GPIO_clearPins(
-        GPIO_PWM_BALL_STEP_C1_PORT, GPIO_PWM_BALL_STEP_C1_PIN);
-    DL_GPIO_enableOutput(
-        GPIO_PWM_BALL_STEP_C1_PORT, GPIO_PWM_BALL_STEP_C1_PIN);
-    gStepRunning = false;
-    gStepFrequencyHz = 0U;
-}
-
-static void set_direction_for_sign(int8_t sign)
-{
-    bool high = sign > 0;
-
-    if (APP_BALL_DIR_INVERT != 0U) {
-        high = !high;
+    if (delta > maximumDelta) {
+        delta = maximumDelta;
+    } else if (delta < -maximumDelta) {
+        delta = -maximumDelta;
     }
-    step_pin_gpio_low();
-    if (high) {
-        DL_GPIO_setPins(GPIO_BALL_DIR_PORT, GPIO_BALL_DIR_DIR_PIN);
-    } else {
-        DL_GPIO_clearPins(GPIO_BALL_DIR_PORT, GPIO_BALL_DIR_DIR_PIN);
-    }
-    gStepSign = sign;
-    gTelemetry.directionLevel = high ? 1U : 0U;
+    return current + delta;
 }
 
-static void configure_and_start_step(uint16_t frequencyHz, int8_t sign)
+static int32_t round_float(float value)
 {
-    uint32_t periodTicks;
+    return (value >= 0.0f) ?
+        (int32_t) (value + 0.5f) : (int32_t) (value - 0.5f);
+}
 
-    if (frequencyHz < APP_BALL_STEP_MIN_HZ) {
-        frequencyHz = APP_BALL_STEP_MIN_HZ;
-    } else if (frequencyHz > APP_BALL_STEP_MAX_HZ) {
-        frequencyHz = APP_BALL_STEP_MAX_HZ;
+static int16_t clamp_i16(int32_t value)
+{
+    if (value < -32768) {
+        return -32768;
     }
-    if (gStepRunning && (sign == gStepSign) &&
-        (frequencyHz == gStepFrequencyHz)) {
+    if (value > 32767) {
+        return 32767;
+    }
+    return (int16_t) value;
+}
+
+static void publish_event(uint8_t event)
+{
+    gTelemetry.event = event;
+    gTelemetry.eventCounter++;
+}
+
+static void reset_control_history(int32_t currentSteps, uint32_t nowMs)
+{
+    gLastOuterUpdateMs = nowMs;
+    gFilteredVelocity = 0.0f;
+    gContinuousTilt = (float) currentSteps;
+    gTiltResidual = 0.0f;
+    gFrictionBoost = 0.0f;
+    gIntegral = 0.0f;
+    gStuckFrames = 0U;
+    gHoldLatched = false;
+}
+
+static void enter_waiting_vision(uint32_t nowMs)
+{
+    BallStepperStatus stepper = ball_stepper_get_status();
+
+    ball_stepper_enable(nowMs);
+    ball_stepper_hold();
+    reset_control_history(stepper.currentSteps, nowMs);
+    gRealArmFrames = 0U;
+    gHaveRealVision = false;
+    gRunRequestMs = nowMs;
+    gTelemetry.state = BALL_ROD_WAITING_VISION;
+    gTelemetry.motionPhase = BALL_MOTION_IDLE;
+    gTelemetry.faultReason = BALL_FAULT_NONE;
+    gTelemetry.runId++;
+    publish_event(BALL_STATUS_EVENT_CENTER_START);
+}
+
+static void pause_control(void)
+{
+    BallStepperStatus stepper;
+
+    ball_stepper_hold();
+    stepper = ball_stepper_get_status();
+    reset_control_history(stepper.currentSteps, 0U);
+    gChassisAccelCompensation = 0.0f;
+    gRunRequested = false;
+    gRealArmFrames = 0U;
+    gTelemetry.state = BALL_ROD_DISARMED;
+    gTelemetry.motionPhase = BALL_MOTION_IDLE;
+    gTelemetry.faultReason = BALL_FAULT_NONE;
+    publish_event(BALL_STATUS_EVENT_CENTER_END);
+}
+
+static void emergency_stop(void)
+{
+    ball_stepper_disarm();
+    gRunRequested = false;
+    gChassisAccelCompensation = 0.0f;
+    gSafetyLatched = true;
+    gRealArmFrames = 0U;
+    gTelemetry.state = BALL_ROD_SAFETY_FAULT;
+    gTelemetry.motionPhase = BALL_MOTION_IDLE;
+    gTelemetry.faultReason = BALL_FAULT_EMERGENCY_STOP;
+    publish_event(BALL_STATUS_EVENT_CENTER_END);
+}
+
+#if APP_BALL_CALIBRATION_MODE
+static void calibration_jog(uint32_t nowMs, int8_t sign)
+{
+    BallStepperStatus stepper = ball_stepper_get_status();
+    int32_t target = stepper.currentSteps +
+        (int32_t) sign * APP_BALL_CALIBRATION_JOG_STEPS;
+
+    ball_stepper_enable(nowMs);
+    ball_stepper_set_requested_hz(APP_BALL_STEP_MIN_HZ);
+    ball_stepper_set_target(target);
+    gTelemetry.state = BALL_ROD_DISARMED;
+    gTelemetry.motionPhase = BALL_MOTION_CALIBRATION;
+}
+#endif
+
+static void handle_short_click(uint32_t nowMs)
+{
+    if (gSafetyLatched) {
         return;
     }
-    if ((!gStepRunning) || (sign != gStepSign)) {
-        set_direction_for_sign(sign);
-    } else {
-        DL_TimerG_stopCounter(PWM_BALL_STEP_INST);
-    }
-
-    periodTicks = APP_BALL_STEP_CLOCK_HZ / frequencyHz;
-    DL_TimerG_setLoadValue(PWM_BALL_STEP_INST, periodTicks);
-    DL_TimerG_setCaptureCompareValue(PWM_BALL_STEP_INST,
-        periodTicks / 2U, DL_TIMER_CC_1_INDEX);
-    DL_GPIO_initPeripheralOutputFunction(
-        GPIO_PWM_BALL_STEP_C1_IOMUX,
-        GPIO_PWM_BALL_STEP_C1_IOMUX_FUNC);
-    DL_GPIO_enableOutput(
-        GPIO_PWM_BALL_STEP_C1_PORT, GPIO_PWM_BALL_STEP_C1_PIN);
-    DL_TimerG_startCounter(PWM_BALL_STEP_INST);
-    gStepFrequencyHz = frequencyHz;
-    gStepRunning = true;
-}
-
-static void move_toward_target(void)
-{
-    int32_t distance = gTargetSteps - gCurrentSteps;
-    uint32_t magnitude = absolute_i32(distance);
-    uint32_t requested;
-    uint16_t nextFrequency;
-    int8_t sign;
-
 #if APP_BALL_CALIBRATION_MODE
-    /*
-     * Calibration jogs must finish on the requested multiple of 16.  The
-     * normal controller's two-step settling tolerance would otherwise make
-     * each button press stop at 14 steps and corrupt the measured limits.
-     */
-    if (magnitude == 0U) {
+    if (gCalibrationClickPending &&
+        ((uint32_t) (nowMs - gCalibrationFirstClickMs) <=
+            APP_BALL_DOUBLE_CLICK_MS)) {
+        gCalibrationClickPending = false;
+        calibration_jog(nowMs, -1);
+    } else {
+        gCalibrationClickPending = true;
+        gCalibrationFirstClickMs = nowMs;
+    }
 #else
-    if (magnitude <= APP_BALL_POSITION_TOLERANCE_STEPS) {
-#endif
-        step_pin_gpio_low();
-        return;
-    }
-    sign = (distance > 0) ? 1 : -1;
-#if APP_BALL_CALIBRATION_MODE
-    requested = APP_BALL_STEP_MIN_HZ +
-        magnitude * APP_BALL_STEP_HZ_PER_ERROR;
-#else
-    requested = gCommandFrequencyHz;
-#endif
-    if (requested > APP_BALL_STEP_MAX_HZ) {
-        requested = APP_BALL_STEP_MAX_HZ;
-    }
-
-    if (!gStepRunning || (sign != gStepSign)) {
-        nextFrequency = APP_BALL_STEP_MIN_HZ;
-    } else if (requested >
-        (uint32_t) gStepFrequencyHz + APP_BALL_STEP_HZ_SLEW_PER_TICK) {
-        nextFrequency =
-            gStepFrequencyHz + APP_BALL_STEP_HZ_SLEW_PER_TICK;
-    } else if (gStepFrequencyHz >
-        requested + APP_BALL_STEP_HZ_SLEW_PER_TICK) {
-        nextFrequency =
-            gStepFrequencyHz - APP_BALL_STEP_HZ_SLEW_PER_TICK;
+    if (gRunRequested) {
+        pause_control();
     } else {
-        nextFrequency = (uint16_t) requested;
+        gRunRequested = true;
+        enter_waiting_vision(nowMs);
     }
-    configure_and_start_step(nextFrequency, sign);
+#endif
 }
 
-#if !APP_BALL_CALIBRATION_MODE
-static void update_pid_target(const BallVisionSample *vision)
-{
-    int32_t x = (int32_t) ((vision->xQ4 + 8U) >> 4U);
-    int32_t error = APP_BALL_IMAGE_CENTER_X - x;
-    uint32_t errorMagnitude;
-    int32_t increment;
-    int32_t desiredTarget;
-    int32_t targetChange;
-
-    /*
-     * Treat 150..170 (inclusive) as the accepted center window.  Suppress
-     * both position and velocity correction there so vision jitter cannot
-     * keep rocking the rod; the slewed target then returns to level.
-     */
-    if ((error >= -APP_BALL_CENTER_DEADBAND_PX) &&
-        (error <= APP_BALL_CENTER_DEADBAND_PX)) {
-        error = 0;
-    }
-    errorMagnitude = absolute_i32(error);
-
-    /*
-     * Continue changing the rod target on every off-center vision frame.
-     * Error magnitude selects both the target increment and pulse frequency;
-     * ball velocity is deliberately not used for early braking.
-     */
-    if (error == 0) {
-        desiredTarget = 0;
-        gCommandFrequencyHz = APP_BALL_FREQUENCY_NEAR_HZ;
-    } else {
-        if (errorMagnitude > APP_BALL_ERROR_LARGE_PX) {
-            increment = APP_BALL_INCREMENT_FAR_STEPS;
-            gCommandFrequencyHz = APP_BALL_FREQUENCY_FAR_HZ;
-        } else if (errorMagnitude > APP_BALL_ERROR_MEDIUM_PX) {
-            increment = APP_BALL_INCREMENT_MEDIUM_STEPS;
-            gCommandFrequencyHz = APP_BALL_FREQUENCY_MEDIUM_HZ;
-        } else {
-            increment = APP_BALL_INCREMENT_NEAR_STEPS;
-            gCommandFrequencyHz = APP_BALL_FREQUENCY_NEAR_HZ;
-        }
-        desiredTarget = gTargetSteps +
-            ((error > 0) ? increment : -increment);
-    }
-
-    desiredTarget = clamp_i32(desiredTarget,
-        -APP_BALL_ANGLE_TARGET_LIMIT_STEPS,
-        APP_BALL_ANGLE_TARGET_LIMIT_STEPS);
-    desiredTarget = clamp_i32(desiredTarget,
-        APP_BALL_MIN_STEPS, APP_BALL_MAX_STEPS);
-
-    /*
-     * Slew the requested rod angle at the 30 Hz vision-frame rate.  This is
-     * the no-angle-sensor equivalent of the li example's fast inner loop and
-     * prevents noisy coordinates from commanding an instant large tilt.
-     */
-    targetChange = clamp_i32(desiredTarget - gTargetSteps,
-        -APP_BALL_TARGET_SLEW_STEPS_PER_FRAME,
-        APP_BALL_TARGET_SLEW_STEPS_PER_FRAME);
-    gTargetSteps = clamp_i32(gTargetSteps + targetChange,
-        APP_BALL_MIN_STEPS, APP_BALL_MAX_STEPS);
-    gTelemetry.ballX = (int16_t) x;
-    gTelemetry.ballError = (int16_t) error;
-}
-#endif
-
-#if APP_BALL_CALIBRATION_MODE
-static void service_calibration_button(uint32_t nowMs, bool pressed)
+static void service_button(uint32_t nowMs, bool pressed)
 {
     if (pressed != gButtonRaw) {
         gButtonRaw = pressed;
         gButtonRawChangedMs = nowMs;
     }
     if ((gButtonStable != gButtonRaw) &&
-        elapsed_ms(nowMs, gButtonRawChangedMs, APP_BUTTON_DEBOUNCE_MS)) {
+        ((uint32_t) (nowMs - gButtonRawChangedMs) >=
+            APP_BUTTON_DEBOUNCE_MS)) {
         gButtonStable = gButtonRaw;
         if (gButtonStable) {
             gButtonPressedMs = nowMs;
             gButtonEmergencyHandled = false;
         } else if (!gButtonEmergencyHandled) {
-            uint32_t heldMs = (uint32_t) (nowMs - gButtonPressedMs);
-
-            if (heldMs >= APP_BALL_BUTTON_LONG_MS) {
-                gCalibrationPositiveDirection =
-                    !gCalibrationPositiveDirection;
-                set_direction_for_sign(
-                    gCalibrationPositiveDirection ? 1 : -1);
-            } else {
-                int32_t target = gCurrentSteps +
-                    (gCalibrationPositiveDirection ?
-                        APP_BALL_CALIBRATION_JOG_STEPS :
-                        -APP_BALL_CALIBRATION_JOG_STEPS);
-
-                gTargetSteps = clamp_i32(target,
-                    -APP_BALL_CALIBRATION_HARD_LIMIT,
-                    APP_BALL_CALIBRATION_HARD_LIMIT);
-            }
+            handle_short_click(nowMs);
         }
     }
-    if (gButtonStable && !gButtonEmergencyHandled &&
-        elapsed_ms(nowMs, gButtonPressedMs, APP_BALL_BUTTON_ESTOP_MS)) {
-        gButtonEmergencyHandled = true;
-        gTargetSteps = gCurrentSteps;
-        step_pin_gpio_low();
-        gTelemetry.state = BALL_ROD_SAFETY_FAULT;
+
+    /* 2 s emergency stop disabled in Q5 mode. */
+    (void)emergency_stop;
+
+#if APP_BALL_CALIBRATION_MODE
+    if (gCalibrationClickPending &&
+        ((uint32_t) (nowMs - gCalibrationFirstClickMs) >
+            APP_BALL_DOUBLE_CLICK_MS)) {
+        gCalibrationClickPending = false;
+        calibration_jog(nowMs, 1);
+    }
+#endif
+}
+
+static void enter_vision_fault(void)
+{
+    BallStepperStatus stepper;
+
+    ball_stepper_hold();
+    stepper = ball_stepper_get_status();
+    reset_control_history(stepper.currentSteps, 0U);
+    gRealArmFrames = 0U;
+    if (gTelemetry.state != BALL_ROD_VISION_FAULT) {
+        publish_event(BALL_STATUS_EVENT_VISION_FAULT);
+    }
+    gTelemetry.state = BALL_ROD_VISION_FAULT;
+    gTelemetry.motionPhase = BALL_MOTION_IDLE;
+    gTelemetry.faultReason = BALL_FAULT_VISION_STALE;
+}
+
+static void update_velocity_filter(int16_t measuredVelocity, uint32_t dtMs)
+{
+    float dtSeconds;
+    float coefficient;
+
+    if (dtMs < APP_BALL_OUTER_DT_MIN_MS) {
+        dtMs = APP_BALL_OUTER_DT_MIN_MS;
+    } else if (dtMs > APP_BALL_OUTER_DT_MAX_MS) {
+        dtMs = APP_BALL_OUTER_DT_MAX_MS;
+    }
+    dtSeconds = (float) dtMs * 0.001f;
+    coefficient = FLOAT_TWO_PI * APP_BALL_VELOCITY_FILTER_HZ * dtSeconds;
+    coefficient = coefficient / (1.0f + coefficient);
+    gFilteredVelocity +=
+        coefficient * ((float) measuredVelocity - gFilteredVelocity);
+}
+
+static float apply_rough_tube_compensation(float baseTilt, int16_t errorQ4)
+{
+    float mappedError = (float) (APP_BALL_POSITION_TO_TILT_SIGN * errorQ4);
+    float errorDirection = (mappedError >= 0.0f) ? 1.0f : -1.0f;
+    float breakaway = (errorDirection > 0.0f) ?
+        APP_BALL_BREAKAWAY_STEPS_POS : APP_BALL_BREAKAWAY_STEPS_NEG;
+    bool nearlyStopped =
+        abs_float(gFilteredVelocity) <= APP_BALL_STUCK_SPEED_PX_S;
+    bool movingTowardTarget =
+        ((float) errorQ4 * gFilteredVelocity) > 0.0f;
+
+    if ((gFrictionBoost * errorDirection) < 0.0f) {
+        gFrictionBoost = 0.0f;
+    }
+    if (nearlyStopped) {
+        if (gStuckFrames < 255U) {
+            gStuckFrames++;
+        }
+    } else {
+        gStuckFrames = 0U;
+    }
+
+    if ((gStuckFrames >= APP_BALL_STUCK_REAL_FRAMES) &&
+        (abs_float(gFrictionBoost) < APP_BALL_FRICTION_MAX_STEPS)) {
+        gFrictionBoost +=
+            errorDirection * APP_BALL_FRICTION_INCREMENT_STEPS;
+        gFrictionBoost = clamp_float(gFrictionBoost,
+            -APP_BALL_FRICTION_MAX_STEPS,
+            APP_BALL_FRICTION_MAX_STEPS);
+        gStuckFrames = 0U;
+        publish_event(BALL_STATUS_EVENT_RECOVERY_REAPPLY);
+    } else if (movingTowardTarget && !nearlyStopped) {
+        gFrictionBoost = move_toward(
+            gFrictionBoost, 0.0f, APP_BALL_FRICTION_DECAY_STEPS);
+    }
+
+    /*
+     * Minimum effective tilt applies only while almost stationary.  When the
+     * ball is moving, the signed D term remains free to brake before crossing
+     * the red line.
+     */
+    if (nearlyStopped && (abs_float(baseTilt) < breakaway)) {
+        baseTilt = errorDirection * breakaway;
+    }
+    return baseTilt + gFrictionBoost;
+}
+
+static void command_continuous_tilt(float desiredTilt, bool leveling)
+{
+    BallStepperStatus stepper = ball_stepper_get_status();
+    float maximumDelta = leveling ?
+        APP_BALL_LEVEL_SLEW_STEPS_PER_FRAME :
+        APP_BALL_TARGET_SLEW_STEPS_PER_FRAME;
+    float quantizedInput;
+    int32_t integerTarget;
+    uint32_t frequency;
+
+    desiredTilt = clamp_float(desiredTilt,
+        -(float) APP_BALL_WORK_TILT_LIMIT_STEPS,
+        (float) APP_BALL_WORK_TILT_LIMIT_STEPS);
+    gContinuousTilt =
+        move_toward(gContinuousTilt, desiredTilt, maximumDelta);
+
+    quantizedInput = gContinuousTilt + gTiltResidual;
+    integerTarget = round_float(quantizedInput);
+    gTiltResidual = quantizedInput - (float) integerTarget;
+    ball_stepper_set_target(integerTarget);
+
+    frequency = APP_BALL_STEP_MIN_HZ +
+        APP_BALL_STEP_HZ_PER_ERROR *
+        (uint32_t) abs_i32(integerTarget - stepper.currentSteps);
+    if (frequency > APP_BALL_STEP_MAX_HZ) {
+        frequency = APP_BALL_STEP_MAX_HZ;
+    }
+    ball_stepper_set_requested_hz((uint16_t) frequency);
+}
+
+static void update_controller_from_real_frame(
+    uint32_t nowMs, const BallVisionSample *vision)
+{
+    uint32_t dtMs = (uint32_t) (nowMs - gLastOuterUpdateMs);
+    int16_t errorQ4 = (int16_t) ((int32_t) gTargetXQ4 -
+        (int32_t) vision->xQ4);
+    float errorPixels = (float) errorQ4 * (1.0f / 16.0f);
+    float desiredTilt;
+    bool enterHold;
+    bool releaseHold;
+
+    update_velocity_filter(vision->velocityX, dtMs);
+    gLastOuterUpdateMs = nowMs;
+    gLastRealVisionMs = nowMs;
+    gHaveRealVision = true;
+
+    gTelemetry.ballX = (int16_t) ((vision->xQ4 + 8U) / 16U);
+    gTelemetry.ballErrorQ4 = errorQ4;
+    gTelemetry.ballError =
+        (int16_t) round_float((float) errorQ4 * (1.0f / 16.0f));
+
+    if (!gRunRequested) {
+        return;
+    }
+    if (gRealArmFrames < APP_BALL_VALID_FRAMES_TO_ARM) {
+        gRealArmFrames++;
+    }
+    if (gRealArmFrames < APP_BALL_VALID_FRAMES_TO_ARM) {
+        gTelemetry.state = BALL_ROD_WAITING_VISION;
+        gTelemetry.motionPhase = BALL_MOTION_IDLE;
+        return;
+    }
+    gTelemetry.faultReason = BALL_FAULT_NONE;
+
+    enterHold =
+        (abs_i32(errorQ4) <= APP_BALL_HOLD_ENTER_ERROR_Q4) &&
+        (abs_float(gFilteredVelocity) <=
+            APP_BALL_HOLD_ENTER_SPEED_PX_S);
+    releaseHold =
+        (abs_i32(errorQ4) >= APP_BALL_HOLD_RELEASE_ERROR_Q4) ||
+        (abs_float(gFilteredVelocity) >=
+            APP_BALL_HOLD_RELEASE_SPEED_PX_S);
+
+    if (!gHoldLatched && enterHold) {
+        gHoldLatched = true;
+        gFrictionBoost = 0.0f;
+        gIntegral = 0.0f;
+        gTiltResidual = 0.0f;
+        gStuckFrames = 0U;
+        publish_event(BALL_STATUS_EVENT_CENTER_SETTLED);
+    } else if (gHoldLatched && releaseHold) {
+        gHoldLatched = false;
+        publish_event(BALL_STATUS_EVENT_CORRECTION_RESUME);
+    }
+
+    if (gHoldLatched) {
+        gTelemetry.state = BALL_ROD_HOLD;
+        gTelemetry.motionPhase = BALL_MOTION_LEVELING;
+        gFrictionBoost = 0.0f;
+        gIntegral = 0.0f;
+        gTiltResidual = 0.0f;
+        gStuckFrames = 0U;
+        command_continuous_tilt(
+            APP_BALL_NEUTRAL_STEPS + gChassisAccelCompensation, true);
+        return;
+    }
+
+    gTelemetry.state = BALL_ROD_ACTIVE;
+    gTelemetry.motionPhase = BALL_MOTION_CORRECTING;
+
+    /*
+     * Continuous PD — 4 个锚点线性插值。
+     *
+     *   锚点  |E|:    0      5      15     40     (px)
+     *          KP:  0.030  0.080  0.120  0.200
+     *          KD:  0.015  0.044  0.066  0.120
+     *     KD/KP:  0.50   0.55   0.55   0.60
+     */
+    {
+        float absErrPx = abs_float(errorPixels);
+        float kp, kd;
+
+        if (absErrPx <= APP_BALL_GAIN_ERROR_1_PX) {
+            float t = absErrPx / APP_BALL_GAIN_ERROR_1_PX;
+            kp = APP_BALL_GAIN_KP_0 +
+                t * (APP_BALL_GAIN_KP_1 - APP_BALL_GAIN_KP_0);
+            kd = APP_BALL_GAIN_KD_0 +
+                t * (APP_BALL_GAIN_KD_1 - APP_BALL_GAIN_KD_0);
+        } else if (absErrPx <= APP_BALL_GAIN_ERROR_2_PX) {
+            float t = (absErrPx - APP_BALL_GAIN_ERROR_1_PX) /
+                (APP_BALL_GAIN_ERROR_2_PX - APP_BALL_GAIN_ERROR_1_PX);
+            kp = APP_BALL_GAIN_KP_1 +
+                t * (APP_BALL_GAIN_KP_2 - APP_BALL_GAIN_KP_1);
+            kd = APP_BALL_GAIN_KD_1 +
+                t * (APP_BALL_GAIN_KD_2 - APP_BALL_GAIN_KD_1);
+        } else if (absErrPx <= APP_BALL_GAIN_ERROR_3_PX) {
+            float t = (absErrPx - APP_BALL_GAIN_ERROR_2_PX) /
+                (APP_BALL_GAIN_ERROR_3_PX - APP_BALL_GAIN_ERROR_2_PX);
+            kp = APP_BALL_GAIN_KP_2 +
+                t * (APP_BALL_GAIN_KP_3 - APP_BALL_GAIN_KP_2);
+            kd = APP_BALL_GAIN_KD_2 +
+                t * (APP_BALL_GAIN_KD_3 - APP_BALL_GAIN_KD_2);
+        } else {
+            kp = APP_BALL_GAIN_KP_3;
+            kd = APP_BALL_GAIN_KD_3;
+        }
+
+        desiredTilt = (float) APP_BALL_POSITION_TO_TILT_SIGN *
+            (kp * errorPixels - kd * gFilteredVelocity);
+        desiredTilt = apply_rough_tube_compensation(
+            desiredTilt, errorQ4);
+        desiredTilt += gChassisAccelCompensation;
+        command_continuous_tilt(desiredTilt, false);
     }
 }
-#endif
+
+static void update_telemetry(
+    uint32_t nowMs, const BallVisionSample *vision)
+{
+    BallStepperStatus stepper = ball_stepper_get_status();
+    int32_t velocityRounded = round_float(gFilteredVelocity);
+    int32_t tiltQ8 = round_float(gContinuousTilt * 256.0f);
+    int32_t frictionQ8 = round_float(gFrictionBoost * 256.0f);
+
+    if (stepper.currentSteps < gMinimumReached) {
+        gMinimumReached = stepper.currentSteps;
+    }
+    if (stepper.currentSteps > gMaximumReached) {
+        gMaximumReached = stepper.currentSteps;
+    }
+
+    gTelemetry.currentSteps = stepper.currentSteps;
+    gTelemetry.targetSteps = stepper.targetSteps;
+    gTelemetry.minimumReached = gMinimumReached;
+    gTelemetry.maximumReached = gMaximumReached;
+    gTelemetry.targetXQ4 = gTargetXQ4;
+    gTelemetry.filteredVelocity = clamp_i16(velocityRounded);
+    gTelemetry.continuousTiltQ8 = clamp_i16(tiltQ8);
+    gTelemetry.frictionBoostQ8 = clamp_i16(frictionQ8);
+    gTelemetry.stepFrequencyHz = stepper.stepHz;
+    gTelemetry.directionLevel = stepper.directionLevel;
+    gTelemetry.stepRunning = stepper.running;
+    gTelemetry.driverEnabled = stepper.enabled;
+    gTelemetry.limitReached = stepper.atLimit;
+    gTelemetry.tiltLimit = APP_BALL_WORK_TILT_LIMIT_STEPS;
+    gTelemetry.armFrames = gRealArmFrames;
+    gTelemetry.centerSettled = gHoldLatched;
+    gTelemetry.practiceActive =
+        (gPracticePhase != BALL_PRACTICE_IDLE);
+    gTelemetry.mustCorrect =
+        abs_i32(gTelemetry.ballErrorQ4) >
+            APP_BALL_HOLD_ENTER_ERROR_Q4;
+    gTelemetry.approachingCenter =
+        ((float) gTelemetry.ballErrorQ4 * gFilteredVelocity) > 0.0f;
+    gTelemetry.recoveryActive = abs_float(gFrictionBoost) > 0.0f;
+    gTelemetry.recoveryPhase = gTelemetry.recoveryActive ?
+        BALL_RECOVERY_STATIC_FRICTION : BALL_RECOVERY_NONE;
+    gTelemetry.crcErrors = vision->crcErrors;
+    gTelemetry.sequenceDrops = vision->sequenceDrops;
+    gTelemetry.rxOverflows = vision->rxOverflows;
+
+    if (gHaveRealVision) {
+        gTelemetry.visionAgeMs =
+            (uint32_t) (nowMs - gLastRealVisionMs);
+    } else {
+        gTelemetry.visionAgeMs = UINT32_MAX;
+    }
+    gTelemetry.visionFresh =
+        gHaveRealVision &&
+        (gTelemetry.visionAgeMs <= APP_BALL_VISION_STALE_MS);
+    gTelemetry.sequenceTimedOut = !gTelemetry.visionFresh;
+}
 
 void ball_rod_init(uint32_t nowMs)
 {
-    gCurrentSteps = 0;
-    gTargetSteps = 0;
-    gStepRunning = false;
-    gStepSign = 1;
-    gStepFrequencyHz = 0U;
-    gCommandFrequencyHz = APP_BALL_FREQUENCY_NEAR_HZ;
+    gTargetXQ4 = APP_BALL_DEFAULT_TARGET_X_Q4;
     gLastVisionSequence = 0U;
     gHaveVisionSequence = false;
+    gHaveRealVision = false;
+    gLastRealVisionMs = nowMs;
+    gRunRequestMs = nowMs;
+    gLastOuterUpdateMs = nowMs;
+    gRealArmFrames = 0U;
+    gFilteredVelocity = 0.0f;
+    gContinuousTilt = 0.0f;
+    gTiltResidual = 0.0f;
+    gFrictionBoost = 0.0f;
+    gChassisAccelCompensation = 0.0f;
+    gIntegral = 0.0f;
+    gStuckFrames = 0U;
+    gHoldLatched = false;
+    gRunRequested = false;
+    gSafetyLatched = false;
+    gMinimumReached = 0;
+    gMaximumReached = 0;
     gButtonRaw = false;
     gButtonStable = false;
     gButtonEmergencyHandled = false;
     gButtonRawChangedMs = nowMs;
     gButtonPressedMs = nowMs;
-    gCalibrationPositiveDirection = true;
-    gTelemetry = (BallRodTelemetry) {0};
-    gTelemetry.minimumReached = 0;
-    gTelemetry.maximumReached = 0;
-
-    step_pin_gpio_low();
-    DL_GPIO_clearPins(GPIO_BALL_DIR_PORT, GPIO_BALL_DIR_DIR_PIN);
-    DL_GPIO_clearPins(GPIO_D36A_EN_PORT, GPIO_D36A_EN_EN_PIN);
-    gDriverEnabled = false;
-
+    gPracticePhase = BALL_PRACTICE_IDLE;
+    gPracticeStartMs = nowMs;
+    gPracticeTargetSettledMs = 0U;
+    gPracticeBalanceTilt = 0.0f;
 #if APP_BALL_CALIBRATION_MODE
-    set_direction_for_sign(1);
-    DL_GPIO_setPins(GPIO_D36A_EN_PORT, GPIO_D36A_EN_EN_PIN);
-    gDriverEnabled = true;
-    gEnableStartMs = nowMs;
-    gTelemetry.state = BALL_ROD_CALIBRATION;
-#else
-    gEnableStartMs = nowMs;
-    gTelemetry.state = BALL_ROD_WAITING_VISION;
+    gCalibrationClickPending = false;
+    gCalibrationFirstClickMs = nowMs;
 #endif
+
+    gTelemetry = (BallRodTelemetry) {0};
+    gTelemetry.state = BALL_ROD_DISARMED;
+    gTelemetry.motionPhase = BALL_MOTION_IDLE;
+    gTelemetry.targetXQ4 = gTargetXQ4;
+    gTelemetry.tiltLimit = APP_BALL_WORK_TILT_LIMIT_STEPS;
+    gTelemetry.faultReason = BALL_FAULT_NONE;
+    ball_stepper_init(nowMs);
+}
+
+void ball_rod_set_target_x_q4(uint16_t targetXQ4)
+{
+    if (targetXQ4 > APP_BALL_TARGET_MAX_X_Q4) {
+        targetXQ4 = APP_BALL_TARGET_MAX_X_Q4;
+    }
+    if (targetXQ4 == gTargetXQ4) {
+        return;
+    }
+    gTargetXQ4 = targetXQ4;
+    gTelemetry.targetXQ4 = gTargetXQ4;
+    if (gTelemetry.state == BALL_ROD_HOLD) {
+        gTelemetry.state = BALL_ROD_ACTIVE;
+        gTelemetry.motionPhase = BALL_MOTION_CORRECTING;
+        publish_event(BALL_STATUS_EVENT_CORRECTION_RESUME);
+    }
+    gHoldLatched = false;
+    gFrictionBoost = 0.0f;
+    gIntegral = 0.0f;
+    gTiltResidual = 0.0f;
+}
+
+bool ball_rod_start(uint32_t nowMs)
+{
+    if (gSafetyLatched) {
+        return false;
+    }
+
+    gRunRequested = true;
+    enter_waiting_vision(nowMs);
+    return true;
+}
+
+void ball_rod_start_practice(uint32_t nowMs)
+{
+    if (gSafetyLatched) {
+        return;
+    }
+    if (!gRunRequested) {
+        gRunRequested = true;
+        enter_waiting_vision(nowMs);
+    }
+    gPracticePhase = BALL_PRACTICE_TO_POS5;
+    gPracticeStartMs = nowMs;
+    gPracticeTargetSettledMs = nowMs;
+    gPracticeBalanceTilt = gContinuousTilt;
+    gHoldLatched = false;
+    gFrictionBoost = 0.0f;
+    gIntegral = 0.0f;
+    ball_rod_set_target_x_q4(APP_BALL_PRACTICE_TARGET_POS5_Q4);
+    publish_event(BALL_STATUS_EVENT_CORRECTION_RESUME);
+}
+
+void ball_rod_set_chassis_accel_compensation_steps(float steps)
+{
+    gChassisAccelCompensation = clamp_float(steps,
+        -APP_Q5_BALL_ACCEL_COMP_LIMIT_STEPS,
+        APP_Q5_BALL_ACCEL_COMP_LIMIT_STEPS);
+}
+
+void ball_rod_pause(void)
+{
+    if (!gSafetyLatched) {
+        pause_control();
+    }
+}
+
+void ball_rod_emergency_stop(void)
+{
+    emergency_stop();
 }
 
 void ball_rod_tick_5ms(
     uint32_t nowMs, bool buttonPressed, const BallVisionSample *vision)
 {
-    gTelemetry.crcErrors = vision->crcErrors;
-    gTelemetry.sequenceDrops = vision->sequenceDrops;
-    gTelemetry.rxOverflows = vision->rxOverflows;
+    bool newFrame;
+    bool realValidFrame;
 
-#if APP_BALL_CALIBRATION_MODE
-    service_calibration_button(nowMs, buttonPressed);
-    if (gTelemetry.state != BALL_ROD_SAFETY_FAULT) {
-        gTelemetry.state = BALL_ROD_CALIBRATION;
-        if (gDriverEnabled &&
-            elapsed_ms(nowMs, gEnableStartMs, APP_D36A_WAKE_DELAY_MS)) {
-            move_toward_target();
-        }
-    }
-#else
-    (void) buttonPressed;
-    if (vision->received &&
+    service_button(nowMs, buttonPressed);
+    newFrame = vision->received &&
         (!gHaveVisionSequence ||
-         (vision->sequence != gLastVisionSequence))) {
-        gLastVisionSequence = vision->sequence;
+            (vision->sequence != gLastVisionSequence));
+    if (newFrame) {
         gHaveVisionSequence = true;
-        if (vision->valid) {
-            update_pid_target(vision);
-        }
+        gLastVisionSequence = vision->sequence;
+    }
+    realValidFrame = newFrame && vision->valid &&
+        ((vision->flags & BALL_VISION_FLAG_PREDICTED) == 0U);
+
+#if !APP_BALL_CALIBRATION_MODE
+    if (realValidFrame) {
+        update_controller_from_real_frame(nowMs, vision);
     }
 
-    if (!gDriverEnabled) {
-        if (vision->valid &&
-            (vision->validStreak >= APP_BALL_VALID_FRAMES_TO_ARM)) {
-            set_direction_for_sign(1);
-            DL_GPIO_setPins(GPIO_D36A_EN_PORT, GPIO_D36A_EN_EN_PIN);
-            gDriverEnabled = true;
-            gEnableStartMs = nowMs;
+    /* Practice mode: timed open-loop sequence. */
+    if (gRunRequested && gPracticePhase != BALL_PRACTICE_IDLE) {
+        float practiceTilt;
+        uint32_t phaseElapsed =
+            (uint32_t)(nowMs - gPracticeTargetSettledMs);
+
+        if (gPracticePhase == BALL_PRACTICE_TO_POS5) {
+            practiceTilt = gPracticeBalanceTilt + 50.0f;
+            if (phaseElapsed >= 1000U) {
+                gPracticePhase = BALL_PRACTICE_TO_NEG5;
+                gPracticeTargetSettledMs = nowMs;
+            }
+        } else if (gPracticePhase == BALL_PRACTICE_TO_NEG5) {
+            practiceTilt = gPracticeBalanceTilt - 33.0f;
+            if (phaseElapsed >= 2000U) {
+                gPracticePhase = BALL_PRACTICE_SETTLED_NEG5;
+                gPracticeTargetSettledMs = nowMs;
+            }
         } else {
-            gTelemetry.state = BALL_ROD_WAITING_VISION;
+            practiceTilt = gPracticeBalanceTilt;
         }
-    } else if (!vision->received ||
-        elapsed_ms(nowMs, vision->lastValidMs,
-            APP_BALL_VISION_FAULT_MS)) {
-        gTargetSteps = 0;
-        gCommandFrequencyHz = APP_BALL_FREQUENCY_NEAR_HZ;
-        gTelemetry.state = BALL_ROD_VISION_FAULT;
-    } else if (elapsed_ms(nowMs, vision->lastValidMs,
-                   APP_BALL_VISION_RETURN_MS)) {
-        gTargetSteps = 0;
-        gCommandFrequencyHz = APP_BALL_FREQUENCY_NEAR_HZ;
-        gTelemetry.state = BALL_ROD_RETURNING;
-    } else {
-        gTelemetry.state = BALL_ROD_ACTIVE;
+        command_continuous_tilt(practiceTilt, false);
     }
 
-    if (gDriverEnabled &&
-        elapsed_ms(nowMs, gEnableStartMs, APP_D36A_WAKE_DELAY_MS)) {
-        move_toward_target();
+    if (gRunRequested &&
+        ((!gHaveRealVision &&
+            ((uint32_t) (nowMs - gRunRequestMs) >
+                APP_BALL_VISION_STALE_MS)) ||
+        (gHaveRealVision &&
+            ((uint32_t) (nowMs - gLastRealVisionMs) >
+                APP_BALL_VISION_STALE_MS)))) {
+        enter_vision_fault();
     }
 #endif
 
-    if (gCurrentSteps < gTelemetry.minimumReached) {
-        gTelemetry.minimumReached = gCurrentSteps;
-    }
-    if (gCurrentSteps > gTelemetry.maximumReached) {
-        gTelemetry.maximumReached = gCurrentSteps;
-    }
-    gTelemetry.currentSteps = gCurrentSteps;
-    gTelemetry.targetSteps = gTargetSteps;
-    gTelemetry.stepFrequencyHz = gStepFrequencyHz;
-    gTelemetry.stepRunning = gStepRunning;
+    ball_stepper_tick_5ms(nowMs);
+    update_telemetry(nowMs, vision);
 }
 
 void ball_rod_step_isr(void)
 {
-    if (DL_TimerG_getPendingInterrupt(PWM_BALL_STEP_INST) ==
-        DL_TIMERG_IIDX_CC1_DN) {
-        gCurrentSteps += gStepSign;
-        if (((gStepSign > 0) && (gCurrentSteps >= gTargetSteps)) ||
-            ((gStepSign < 0) && (gCurrentSteps <= gTargetSteps))) {
-            gCurrentSteps = gTargetSteps;
-            step_pin_gpio_low();
-        }
-    }
+    ball_stepper_step_isr();
 }
 
 BallRodTelemetry ball_rod_get_telemetry(void)
@@ -392,10 +710,6 @@ BallRodTelemetry ball_rod_get_telemetry(void)
 
     __disable_irq();
     telemetry = gTelemetry;
-    telemetry.currentSteps = gCurrentSteps;
-    telemetry.targetSteps = gTargetSteps;
-    telemetry.stepFrequencyHz = gStepFrequencyHz;
-    telemetry.stepRunning = gStepRunning;
     if (primask == 0U) {
         __enable_irq();
     }

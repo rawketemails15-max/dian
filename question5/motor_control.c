@@ -304,7 +304,7 @@ void motor_control_update_20ms(uint32_t nowMs, uint16_t targetCountA,
 }
 
 void motor_control_drive_pwm_5ms(uint32_t nowMs, uint16_t pwmTicksA,
-    uint16_t pwmTicksB, bool stallDetectionEnabled)
+    uint16_t pwmTicksB)
 {
     int32_t countA;
     int32_t countB;
@@ -337,18 +337,12 @@ void motor_control_drive_pwm_5ms(uint32_t nowMs, uint16_t pwmTicksA,
         gMotorB.lastMotionMs = nowMs;
     }
 
-    if (!stallDetectionEnabled) {
-        gMotorA.lastMotionMs = nowMs;
-        gMotorB.lastMotionMs = nowMs;
-        gTelemetry.stalled = false;
-    }
-
-    if (stallDetectionEnabled && (((pwmTicksA != 0U) &&
+    if (((pwmTicksA != 0U) &&
             ((uint32_t) (nowMs - gMotorA.lastMotionMs) >=
                 APP_ENCODER_STALL_TIMEOUT_MS)) ||
         ((pwmTicksB != 0U) &&
             ((uint32_t) (nowMs - gMotorB.lastMotionMs) >=
-                APP_ENCODER_STALL_TIMEOUT_MS)))) {
+                APP_ENCODER_STALL_TIMEOUT_MS))) {
         gTelemetry.encoderCountA = countA;
         gTelemetry.encoderCountB = countB;
         gTelemetry.speedCountA = gMotorA.speedCount;

@@ -103,9 +103,10 @@ GPIO7.associatedPins[3].$name       = "OUT";
 GPIO7.associatedPins[3].direction   = "INPUT";
 GPIO7.associatedPins[3].pin.$assign = "PA27";
 
-GPIO8.$name                         = "OLED_RST";
-GPIO8.associatedPins[0].$name       = "RST";
-GPIO8.associatedPins[0].pin.$assign = "PB14";
+GPIO8.$name                          = "OLED_RST";
+GPIO8.associatedPins[0].$name        = "RST";
+GPIO8.associatedPins[0].initialValue = "SET";
+GPIO8.associatedPins[0].pin.$assign  = "PB14";
 
 GPIO9.$name                          = "OLED_DC";
 GPIO9.associatedPins[0].$name        = "DC";

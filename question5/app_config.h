@@ -21,15 +21,15 @@
  * in PWM ticks per error unit/tick so the controller remains integer-only.
  * The I term is deliberately small and active only near the line center.
  */
-#define APP_TRACK_BASE_PWM                      (3000U)
-#define APP_TRACK_FINAL_PWM                     (1800U)
+#define APP_TRACK_BASE_PWM                      (5000U)
+#define APP_TRACK_FINAL_PWM                     (5000U)
 #define APP_TRACK_CENTER_DEADBAND                (60)
 #define APP_TRACK_ERROR_FILTER_DIVISOR           (4)
 #define APP_TRACK_PWM_SLEW_PER_TICK              (200)
-#define APP_LINE_PID_KP                          (5)
+#define APP_LINE_PID_KP                          (8)
 #define APP_LINE_PID_KI_NUMERATOR                (1)
 #define APP_LINE_PID_KI_DIVISOR                  (64)
-#define APP_LINE_PID_KD                          (10)
+#define APP_LINE_PID_KD                          (16)
 #define APP_LINE_PID_D_FILTER_DIVISOR            (4)
 #define APP_LINE_PID_INTEGRAL_ACTIVE_ERROR       (150)
 #define APP_LINE_PID_INTEGRAL_LIMIT              (12800)
@@ -44,11 +44,12 @@
 
 #define APP_START_MARKER_CLEAR_MS              (50U)
 #define APP_START_MARKER_CLEAR_COUNTS          (300U)
-#define APP_FINISH_ARM_COUNTS                  (38000U)
-#define APP_FINISH_ARM_MS                      (10000U)
+#define APP_FINISH_ARM_COUNTS                  (30000U)
+#define APP_FINISH_ARM_MS                      (0U)
 #define APP_FINAL_APPROACH_COUNTS              (45500U)
+#define APP_FINISH_MARKER_MIN_CHANNELS         (4U)
+#define APP_FINISH_POST_MARKER_MS              (1000U)
 #define APP_MARKER_MIN_CONTIGUOUS_CHANNELS     (4U)
-#define APP_MARKER_CONFIRM_SCANS               (2U)
 
 #define APP_LINE_CHANNEL_COUNT                 (8U)
 #define APP_LINE_MUX_SETTLE_US                 (100U)
@@ -88,50 +89,14 @@
 /*
  * Question 5 supervisor.
  *
- * The first short click starts only the ball-rod controller.  A later pair
- * of short clicks inside APP_Q5_DRIVE_DOUBLE_CLICK_MS starts the chassis from
- * idle, complete, or drive-fault states.  Clicks are ignored while a drive
- * sequence is active.  Its 30 s timer begins with the successful double
- * click.  Ball and chassis faults are otherwise isolated; a 2 s button hold
- * is the only global emergency stop.
+ * The first short click starts only the ball-rod controller.  Every later
+ * pair of short clicks inside APP_Q5_DRIVE_DOUBLE_CLICK_MS starts or restarts
+ * the chassis line-following controller.  Its 30 s timer begins with that
+ * successful double click.  Ball and chassis faults are otherwise isolated;
+ * a 2 s button hold is the only global emergency stop.
  */
-#define APP_Q5_RUN_TIMEOUT_MS                  (30000U)
+#define APP_Q5_RUN_TIMEOUT_MS                  (20000U)
 #define APP_Q5_DRIVE_DOUBLE_CLICK_MS             (1000U)
-
-/*
- * Chassis acceleration feed-forward for the ball rod, in microsteps.
- *
- * Positive START compensation matches the measured start-up drift toward
- * smaller K230 x coordinates.  Negative BRAKE compensation matches the
- * measured braking drift toward larger x coordinates.  Tune each value in
- * 2..4 microstep increments; reverse its sign if the disturbance worsens.
- */
-#define APP_Q5_BALL_START_ACCEL_COMP_STEPS       (12.0f)
-#define APP_Q5_BALL_BRAKE_ACCEL_COMP_STEPS      (-12.0f)
-#define APP_Q5_BALL_ACCEL_COMP_LIMIT_STEPS        (24.0f)
-
-/* Start: establish rod angle, then ramp chassis PWM to normal in 500 ms. */
-#define APP_Q5_START_PRELOAD_MS                    (100U)
-#define APP_Q5_START_ACCEL_MS                      (500U)
-
-/*
- * Finish: hold low-speed line following for 100 ms while pre-tilting, then
- * ramp both forward PWM and steering authority to zero during the remaining
- * 900 ms.  Tune ALIGN_PWM so the on-car travel is approximately 34 cm.
- */
-#define APP_Q5_FINISH_TOTAL_MS                    (1000U)
-#define APP_Q5_FINISH_PRELOAD_MS                   (100U)
-#define APP_Q5_FINISH_ALIGN_PWM                   (1800U)
-
-#if APP_Q5_FINISH_TOTAL_MS <= APP_Q5_FINISH_PRELOAD_MS
-#error "APP_Q5_FINISH_TOTAL_MS must exceed APP_Q5_FINISH_PRELOAD_MS"
-#endif
-#if APP_Q5_START_ACCEL_MS == 0U
-#error "APP_Q5_START_ACCEL_MS must be nonzero"
-#endif
-#if APP_Q5_FINISH_ALIGN_PWM == 0U
-#error "APP_Q5_FINISH_ALIGN_PWM must be nonzero"
-#endif
 
 /*
  * Ball rod installation.
@@ -148,7 +113,12 @@
 #define APP_BALL_NEUTRAL_STEPS                  (0.0f)
 #define APP_BALL_WORK_TILT_LIMIT_STEPS          (64)
 #define APP_BALL_CALIBRATION_JOG_STEPS          (16)
+#define APP_BALL_BUTTON_PRACTICE_MS             (1000U)
 #define APP_BALL_BUTTON_ESTOP_MS                (2000U)
+#define APP_BALL_PRACTICE_TARGET_POS5_Q4        (3776U)
+#define APP_BALL_PRACTICE_TARGET_NEG5_Q4        (1696U)
+#define APP_BALL_PRACTICE_TIMEOUT_MS            (5000U)
+#define APP_BALL_PRACTICE_TOLERANCE_Q4          (240)
 
 /* Red-line target: AI x=0..319 px, default x=171 px. */
 #define APP_BALL_TARGET_MIN_X_Q4                (0U)
@@ -164,8 +134,8 @@
  * These are conservative bench defaults and are the main real-car tuning
  * surface: first KP, then KD.
  */
-#define APP_BALL_POSITION_KP                    (0.60f)
-#define APP_BALL_POSITION_KD                    (0.080f)
+#define APP_BALL_POSITION_KP                    (0.50f)
+#define APP_BALL_POSITION_KD                    (0.15f)
 #define APP_BALL_VELOCITY_FILTER_HZ             (3.0f)
 #define APP_BALL_OUTER_DT_MIN_MS                (15U)
 #define APP_BALL_OUTER_DT_MAX_MS                (100U)

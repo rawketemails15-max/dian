@@ -2,7 +2,7 @@
 #define APP_CONFIG_H_
 
 /*
- * 26H requirement 2 tuning constants.
+ * 26H line-following tuning constants.
  *
  * Encoder targets are counts measured over each 20 ms PI update.  The four
  * track constants below are the intended on-car tuning surface; the state
@@ -14,32 +14,43 @@
 
 #define APP_BUTTON_ACTIVE_LEVEL                (1U)
 #define APP_BUTTON_DEBOUNCE_MS                 (30U)
+#define APP_MENU_DOUBLE_CLICK_MS               (300U)
+#define APP_Q56_DRIVE_DOUBLE_CLICK_MS          (1000U)
+#define APP_BUTTON_IGNORE_LONG_MS              (1000U)
 
 /*
  * Grayscale position PID, executed every 5 ms.  Gains are expressed directly
  * in PWM ticks per error unit/tick so the controller remains integer-only.
  * The I term is deliberately small and active only near the line center.
  */
-#define APP_TRACK_BASE_PWM                      (3000U)
-#define APP_TRACK_FINAL_PWM                     (1800U)
-#define APP_TRACK_CENTER_DEADBAND                (60)
-#define APP_TRACK_ERROR_FILTER_DIVISOR           (4)
-#define APP_TRACK_PWM_SLEW_PER_TICK              (200)
-#define APP_LINE_PID_KP                          (5)
-#define APP_LINE_PID_KI_NUMERATOR                (1)
-#define APP_LINE_PID_KI_DIVISOR                  (64)
-#define APP_LINE_PID_KD                          (10)
-#define APP_LINE_PID_D_FILTER_DIVISOR            (4)
-#define APP_LINE_PID_INTEGRAL_ACTIVE_ERROR       (150)
-#define APP_LINE_PID_INTEGRAL_LIMIT              (12800)
-#define APP_LINE_PID_OUTPUT_LIMIT                (3000)
+#define APP_Q2_TRACK_BASE_PWM                    (3000U)
+#define APP_Q2_TRACK_FINAL_PWM                   (1800U)
+#define APP_Q2_TRACK_PWM_SLEW_PER_TICK            (200)
+#define APP_Q2_LINE_PID_KP                        (5)
+#define APP_Q2_LINE_PID_KD                        (10)
+
+#define APP_Q456_TRACK_BASE_PWM                  (2500U)
+#define APP_Q456_TRACK_FINAL_PWM                 (1000U)
+#define APP_Q456_TRACK_PWM_SLEW_PER_TICK          (100)
+#define APP_Q456_LINE_PID_KP                      (8)
+#define APP_Q456_LINE_PID_KD                      (16)
+
+#define APP_TRACK_CENTER_DEADBAND                  (60)
+#define APP_TRACK_ERROR_FILTER_DIVISOR             (4)
+#define APP_LINE_PID_KI_NUMERATOR                  (1)
+#define APP_LINE_PID_KI_DIVISOR                    (64)
+#define APP_LINE_PID_D_FILTER_DIVISOR              (4)
+#define APP_LINE_PID_INTEGRAL_ACTIVE_ERROR         (150)
+#define APP_LINE_PID_INTEGRAL_LIMIT                (12800)
+#define APP_LINE_PID_OUTPUT_LIMIT                  (3000)
 
 /* Retained for the optional encoder-speed PI interface. */
 #define APP_MOTOR_TARGET_MAX_COUNTS            (68U)
 
 #define APP_LINE_LOST_TIMEOUT_MS               (100U)
 #define APP_ENCODER_STALL_TIMEOUT_MS           (300U)
-#define APP_RUN_TIMEOUT_MS                     (20000U)
+#define APP_Q2_RUN_TIMEOUT_MS                  (20000U)
+#define APP_Q56_RUN_TIMEOUT_MS                 (30000U)
 
 #define APP_START_MARKER_CLEAR_MS              (50U)
 #define APP_START_MARKER_CLEAR_COUNTS          (300U)
@@ -76,52 +87,104 @@
 /*
  * Application mode.
  *
- * The ball-static mode deliberately leaves the completed line-following
- * implementation in this project, but keeps both chassis motors braked.
+ * QUESTION5 runs the completed line-following and ball-centering controllers
+ * concurrently.  BALL_STATIC is retained as a bench-test mode.
  */
 #define APP_OPERATION_MODE_LINE_FOLLOW         (0U)
 #define APP_OPERATION_MODE_BALL_STATIC         (1U)
-#define APP_OPERATION_MODE                     APP_OPERATION_MODE_BALL_STATIC
+#define APP_OPERATION_MODE_QUESTION5           (2U)
+#define APP_OPERATION_MODE                     APP_OPERATION_MODE_QUESTION5
 
 /*
- * First installation must remain in calibration mode.  Remove the ball and
- * manually level the rod before power-on.  Record the safe travel displayed
- * on the OLED, subtract 16 steps at each end, update MIN/MAX and DIR_INVERT,
- * then set APP_BALL_CALIBRATION_MODE to 0 and rebuild.
+ * Stable chassis supervisor used only by questions 4, 5 and 6.  Question 4
+ * disables finish detection and timeout at runtime; questions 5/6 keep the
+ * 30 s limit and the full finish-deceleration profile.
  */
-#define APP_BALL_CALIBRATION_MODE              (0U)
-#define APP_BALL_MIN_STEPS                     (-238)
-#define APP_BALL_MAX_STEPS                     (238)
+#define APP_Q5_BALL_START_ACCEL_COMP_STEPS       (12.0f)
+#define APP_Q5_BALL_BRAKE_ACCEL_COMP_STEPS      (-12.0f)
+#define APP_Q5_BALL_ACCEL_COMP_LIMIT_STEPS        (24.0f)
+#define APP_Q5_START_PRELOAD_MS                   (100U)
+#define APP_Q5_START_ACCEL_MS                     (500U)
+#define APP_Q5_FINISH_TOTAL_MS                   (1000U)
+#define APP_Q5_FINISH_PRELOAD_MS                  (100U)
+#define APP_Q5_FINISH_ALIGN_PWM                  (1800U)
+
+/*
+ * Ball rod installation.
+ *
+ * The rod has no angle sensor, encoder or limit switch.  Level it by hand
+ * before every power-up; software then calls that pose zero.  The +/-238
+ * limits are unconditional actuator limits, independent of controller state.
+ */
+#define APP_BALL_CALIBRATION_MODE               (0U)
+#define APP_BALL_MIN_STEPS                      (-238)
+#define APP_BALL_MAX_STEPS                      (238)
 #define APP_BALL_DIR_INVERT                     (0U)
-#define APP_BALL_CALIBRATION_HARD_LIMIT         (256)
+#define APP_BALL_POSITION_TO_TILT_SIGN          (1)
+#define APP_BALL_NEUTRAL_STEPS                  (0.0f)
+#define APP_BALL_WORK_TILT_LIMIT_STEPS          (64)
 #define APP_BALL_CALIBRATION_JOG_STEPS          (16)
-#define APP_BALL_BUTTON_LONG_MS                 (600U)
 #define APP_BALL_BUTTON_ESTOP_MS                (2000U)
+#define APP_BALL_PRACTICE_TARGET_POS5_Q4        (3776U)
+#define APP_BALL_PRACTICE_TARGET_NEG5_Q4        (1696U)
+#define APP_BALL_PRACTICE_TIMEOUT_MS            (5000U)
+#define APP_BALL_PRACTICE_TOLERANCE_Q4          (240)
 
-#define APP_BALL_IMAGE_CENTER_X                 (160)
-#define APP_BALL_CENTER_DEADBAND_PX             (5)
-#define APP_BALL_VALID_FRAMES_TO_ARM            (5U)
-#define APP_BALL_VISION_RETURN_MS               (150U)
-#define APP_BALL_VISION_FAULT_MS                (1000U)
+/* Red-line target: AI x=0..319 px, default x=171 px. */
+#define APP_BALL_TARGET_MIN_X_Q4                (0U)
+#define APP_BALL_TARGET_MAX_X_Q4                (5104U)
+#define APP_BALL_DEFAULT_TARGET_X_Q4            (2736U)
+#define APP_BALL_VALID_FRAMES_TO_ARM            (3U)
+#define APP_BALL_VISION_STALE_MS                (150U)
+#define APP_BALL_STATUS_PERIOD_MS               (50U)
+#define APP_BALL_PROTOCOL_INTERBYTE_TIMEOUT_MS  (20U)
 
-/* Coordinate-band controller: no PD velocity braking. */
-#define APP_BALL_ERROR_MEDIUM_PX                (30)
-#define APP_BALL_ERROR_LARGE_PX                 (80)
-#define APP_BALL_INCREMENT_NEAR_STEPS           (4)
-#define APP_BALL_INCREMENT_MEDIUM_STEPS         (8)
-#define APP_BALL_INCREMENT_FAR_STEPS            (12)
-#define APP_BALL_FREQUENCY_NEAR_HZ              (150U)
-#define APP_BALL_FREQUENCY_MEDIUM_HZ            (300U)
-#define APP_BALL_FREQUENCY_FAR_HZ               (500U)
-#define APP_BALL_ANGLE_TARGET_LIMIT_STEPS       (238)
-#define APP_BALL_TARGET_SLEW_STEPS_PER_FRAME    (12)
+/*
+ * Segmented position PD.  Output is a continuous relative rod angle in
+ * microsteps.  Every anchor is configurable here; the controller linearly
+ * interpolates between adjacent error anchors.
+ */
+#define APP_BALL_GAIN_ERROR_1_PX                (5.0f)
+#define APP_BALL_GAIN_ERROR_2_PX                (15.0f)
+#define APP_BALL_GAIN_ERROR_3_PX                (40.0f)
+#define APP_BALL_GAIN_KP_0                      (0.030f)
+#define APP_BALL_GAIN_KP_1                      (0.080f)
+#define APP_BALL_GAIN_KP_2                      (0.120f)
+#define APP_BALL_GAIN_KP_3                      (0.200f)
+#define APP_BALL_GAIN_KD_0                      (0.015f)
+#define APP_BALL_GAIN_KD_1                      (0.044f)
+#define APP_BALL_GAIN_KD_2                      (0.066f)
+#define APP_BALL_GAIN_KD_3                      (0.120f)
+#define APP_BALL_VELOCITY_FILTER_HZ             (3.0f)
+#define APP_BALL_OUTER_DT_MIN_MS                (15U)
+#define APP_BALL_OUTER_DT_MAX_MS                (100U)
+#define APP_BALL_TARGET_SLEW_STEPS_PER_FRAME    (8.0f)
+#define APP_BALL_LEVEL_SLEW_STEPS_PER_FRAME     (4.0f)
 
+/* Hold-zone hysteresis prevents STEP chatter at the red line. */
+#define APP_BALL_HOLD_ENTER_ERROR_Q4            (96)
+#define APP_BALL_HOLD_RELEASE_ERROR_Q4          (160)
+#define APP_BALL_HOLD_ENTER_SPEED_PX_S          (6.0f)
+#define APP_BALL_HOLD_RELEASE_SPEED_PX_S        (14.0f)
+
+/*
+ * Rough-tube static-friction compensation.  Positive and negative breakaway
+ * values are deliberately independent because the tube is not uniform.
+ */
+#define APP_BALL_BREAKAWAY_STEPS_POS            (64.0f)
+#define APP_BALL_BREAKAWAY_STEPS_NEG            (64.0f)
+#define APP_BALL_STUCK_SPEED_PX_S               (8.0f)
+#define APP_BALL_STUCK_REAL_FRAMES              (4U)
+#define APP_BALL_FRICTION_INCREMENT_STEPS       (16.0f)
+#define APP_BALL_FRICTION_MAX_STEPS             (32.0f)
+#define APP_BALL_FRICTION_DECAY_STEPS           (4.0f)
+
+/* D36A STEP generator: arbitrary finite pulse packets with frequency ramp. */
 #define APP_BALL_STEP_CLOCK_HZ                  (4000000U)
-#define APP_BALL_STEP_MIN_HZ                    (100U)
-#define APP_BALL_STEP_MAX_HZ                    (800U)
-#define APP_BALL_STEP_HZ_PER_ERROR              (20U)
+#define APP_BALL_STEP_MIN_HZ                    (80U)
+#define APP_BALL_STEP_MAX_HZ                    (300U)
+#define APP_BALL_STEP_HZ_PER_ERROR              (8U)
 #define APP_BALL_STEP_HZ_SLEW_PER_TICK          (10U)
-#define APP_BALL_POSITION_TOLERANCE_STEPS       (2)
 #define APP_D36A_WAKE_DELAY_MS                  (1U)
 
 #define APP_BALL_LED_WAIT_TOGGLE_MS             (500U)

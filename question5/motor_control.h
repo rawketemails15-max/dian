@@ -23,7 +23,7 @@ void motor_control_brake(void);
 void motor_control_update_20ms(uint32_t nowMs, uint16_t targetCountA,
     uint16_t targetCountB);
 void motor_control_drive_pwm_5ms(uint32_t nowMs, uint16_t pwmTicksA,
-    uint16_t pwmTicksB, bool stallDetectionEnabled);
+    uint16_t pwmTicksB);
 
 void motor_control_handle_encoder_a_irq(void);
 void motor_control_handle_encoder_b_irq(void);

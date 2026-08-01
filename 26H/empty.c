@@ -36,6 +36,7 @@
 #include "ball_protocol.h"
 #include "ball_rod_control.h"
 #include "motor_control.h"
+#include "q3_control.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -64,18 +65,64 @@
 #define OLED_FIRST_PAGE        (1U)
 #define OLED_RENDER_PAGE_COUNT (5U)
 #define OLED_TOP_PIXEL         (12U)
+#define OLED_HALF_CLOCK_CYCLES (CPUCLK_FREQ / 4000000U)
+#define OLED_HEIGHT_PIXELS     (64U)
+#define OLED_PAGE_COUNT        (8U)
 
 #define LINE_SETTLE_CYCLES \
     ((CPUCLK_FREQ / 1000000U) * APP_LINE_MUX_SETTLE_US)
 
 typedef enum {
     DRIVE_IDLE = 0,
+    DRIVE_START_PRELOAD,
     DRIVE_LEAVING_START,
     DRIVE_TRACKING,
     DRIVE_FINAL_APPROACH,
+    DRIVE_FINISH_DECEL,
     DRIVE_COMPLETE,
     DRIVE_FAULT
 } DriveState;
+
+typedef enum {
+    APP_MENU = 0,
+    APP_Q2_TRACK,
+    APP_Q3_TRIM,
+    APP_Q4_BALL_AB,
+    APP_Q56_POS_TRACK
+} AppMode;
+
+typedef struct {
+    uint16_t basePwm;
+    uint16_t finalPwm;
+    int32_t pwmSlewPerTick;
+    int32_t kp;
+    int32_t kd;
+    uint32_t timeoutMs;
+    bool stableSupervisor;
+    bool finishEnabled;
+} DriveProfile;
+
+static const DriveProfile gQ2DriveProfile = {
+    APP_Q2_TRACK_BASE_PWM,
+    APP_Q2_TRACK_FINAL_PWM,
+    APP_Q2_TRACK_PWM_SLEW_PER_TICK,
+    APP_Q2_LINE_PID_KP,
+    APP_Q2_LINE_PID_KD,
+    APP_Q2_RUN_TIMEOUT_MS,
+    false,
+    true
+};
+
+static const DriveProfile gQ456DriveProfile = {
+    APP_Q456_TRACK_BASE_PWM,
+    APP_Q456_TRACK_FINAL_PWM,
+    APP_Q456_TRACK_PWM_SLEW_PER_TICK,
+    APP_Q456_LINE_PID_KP,
+    APP_Q456_LINE_PID_KD,
+    APP_Q56_RUN_TIMEOUT_MS,
+    true,
+    true
+};
 
 static volatile uint32_t gMs;
 static volatile uint8_t gControlTicksPending;
@@ -102,11 +149,38 @@ static bool gStartMarkerClearActive;
 static bool gLineLostActive;
 static bool gFinishArmed;
 static bool gDisplayDirty = true;
+static uint32_t gQuestion5DriveFirstClickMs;
+static bool gQuestion5BallStarted;
+static uint8_t gQuestion5DriveClickCount;
+static bool gTargetSelectionAllowed;
+static bool gTargetLocked;
+static uint32_t gDriveStartPreloadMs;
+static uint32_t gDriveMotionStartMs;
+static uint32_t gDriveFinishStartMs;
+static const DriveProfile *gDriveProfile = &gQ2DriveProfile;
+static bool gDriveFinishEnabled;
+static uint32_t gDriveTimeoutMs;
 
 static uint8_t gButtonRaw;
 static uint8_t gButtonStable;
 static uint32_t gButtonRawChangedMs;
+static bool gButtonArmed;
+static bool gButtonPressActive;
+static uint32_t gButtonPressStartMs;
 static uint32_t gBallLedLastToggleMs;
+static uint32_t gBallLastStatusMs;
+static uint16_t gBallLastEventCounter;
+static uint32_t gBallLastTargetUpdateCounter;
+static AppMode gAppMode;
+static uint8_t gMenuItem;
+static bool gMenuClickPending;
+static uint32_t gMenuFirstClickMs;
+static bool gMenuDirty = true;
+static uint8_t gOledPixels[OLED_PAGE_COUNT][OLED_WIDTH_PIXELS];
+
+static void oled_write_adjustment(int8_t direction, int32_t positionSteps);
+static void oled_show_small_message(const char *message);
+static void oled_render_menu(void);
 
 static bool elapsed_ms(uint32_t startMs, uint32_t durationMs)
 {
@@ -135,7 +209,7 @@ static int32_t slew_i32(int32_t current, int32_t target, int32_t maximumStep)
     return target;
 }
 
-static int32_t line_pid_update(int32_t error)
+static int32_t line_pid_update(int32_t error, const DriveProfile *profile)
 {
     int32_t errorMagnitude = (error < 0) ? -error : error;
     int32_t derivativeInput = error - gLinePidPreviousError;
@@ -171,10 +245,10 @@ static int32_t line_pid_update(int32_t error)
     }
     gLinePidPreviousError = error;
 
-    proportionalTerm = error * APP_LINE_PID_KP;
+    proportionalTerm = error * profile->kp;
     integralTerm = (gLinePidIntegral *
         APP_LINE_PID_KI_NUMERATOR) / APP_LINE_PID_KI_DIVISOR;
-    derivativeTerm = gLinePidDerivative * APP_LINE_PID_KD;
+    derivativeTerm = gLinePidDerivative * profile->kd;
 
     return clamp_i32(proportionalTerm + integralTerm + derivativeTerm,
         -APP_LINE_PID_OUTPUT_LIMIT, APP_LINE_PID_OUTPUT_LIMIT);
@@ -192,15 +266,21 @@ static uint32_t abs_delta_i32(int32_t value, int32_t origin)
 
 static void wait_ms(uint32_t durationMs)
 {
-    uint32_t startMs = gMs;
-
-    while (!elapsed_ms(startMs, durationMs)) {
-        __WFI();
+    while (durationMs-- != 0U) {
+        DL_Common_delayCycles(CPUCLK_FREQ / 1000U);
     }
 }
 
 static void oled_write_byte(uint8_t value, bool data)
 {
+    uint32_t primask = __get_PRIMASK();
+
+    /*
+     * STEP/UART interrupts must not split one software-serial byte.  Keep
+     * the critical section byte-sized so the real-time pulse counter is
+     * delayed only a few microseconds.
+     */
+    __disable_irq();
     if (data) {
         DL_GPIO_setPins(DISPLAY_DC_PORT, DISPLAY_DC_PIN);
     } else {
@@ -209,13 +289,18 @@ static void oled_write_byte(uint8_t value, bool data)
 
     for (uint8_t bit = 0U; bit < 8U; bit++) {
         DL_GPIO_clearPins(DISPLAY_SCL_PORT, DISPLAY_SCL_PIN);
+        DL_Common_delayCycles(OLED_HALF_CLOCK_CYCLES);
         if ((value & 0x80U) != 0U) {
             DL_GPIO_setPins(DISPLAY_SDA_PORT, DISPLAY_SDA_PIN);
         } else {
             DL_GPIO_clearPins(DISPLAY_SDA_PORT, DISPLAY_SDA_PIN);
         }
         DL_GPIO_setPins(DISPLAY_SCL_PORT, DISPLAY_SCL_PIN);
+        DL_Common_delayCycles(OLED_HALF_CLOCK_CYCLES);
         value <<= 1U;
+    }
+    if (primask == 0U) {
+        __enable_irq();
     }
 }
 
@@ -287,6 +372,9 @@ static const uint8_t *oled_small_glyph(char character)
     static const uint8_t colon[5] = {0U, 0x36U, 0x36U, 0U, 0U};
     static const uint8_t plus[5] = {0x08U, 0x08U, 0x3EU, 0x08U, 0x08U};
     static const uint8_t minus[5] = {0x08U, 0x08U, 0x08U, 0x08U, 0x08U};
+    static const uint8_t greater[5] = {0x41U, 0x22U, 0x14U, 0x08U, 0x00U};
+    static const uint8_t ampersand[5] = {0x36U, 0x49U, 0x55U, 0x22U, 0x50U};
+    static const uint8_t question[5] = {0x02U, 0x01U, 0x51U, 0x09U, 0x06U};
 
     if ((character >= '0') && (character <= '9')) {
         return digits[(uint8_t) (character - '0')];
@@ -302,6 +390,15 @@ static const uint8_t *oled_small_glyph(char character)
     }
     if (character == '-') {
         return minus;
+    }
+    if (character == '>') {
+        return greater;
+    }
+    if (character == '&') {
+        return ampersand;
+    }
+    if (character == '?') {
+        return question;
     }
     return blank;
 }
@@ -403,7 +500,7 @@ static void oled_init(void)
 
 static const uint8_t *oled_glyph(char character, uint8_t *width)
 {
-    static const char characters[] = "0123456789.Ers";
+    static const char characters[] = "0123456789.ErsDIR+-";
     static const uint8_t glyphs[][3] = {
         {0x7FU, 0x41U, 0x7FU},
         {0x42U, 0x7FU, 0x40U},
@@ -419,6 +516,11 @@ static const uint8_t *oled_glyph(char character, uint8_t *width)
         {0x7FU, 0x49U, 0x49U},
         {0x7CU, 0x04U, 0x04U},
         {0x4FU, 0x49U, 0x79U},
+        {0x7FU, 0x41U, 0x3EU},
+        {0x41U, 0x7FU, 0x41U},
+        {0x7FU, 0x09U, 0x76U},
+        {0x08U, 0x1CU, 0x08U},
+        {0x08U, 0x08U, 0x08U},
     };
     static const uint8_t blank[3] = {0U, 0U, 0U};
 
@@ -509,8 +611,8 @@ static void format_elapsed_time(uint32_t elapsedMs, char text[6])
     uint32_t seconds;
     uint8_t index = 0U;
 
-    if (tenths > 200U) {
-        tenths = 200U;
+    if (tenths > 300U) {
+        tenths = 300U;
     }
     seconds = tenths / 10U;
     if (seconds >= 10U) {
@@ -542,9 +644,11 @@ static void __attribute__((unused)) oled_service(void)
 
     if (gDriveState == DRIVE_COMPLETE) {
         shownMs = gFrozenElapsedMs;
-    } else if ((gDriveState == DRIVE_LEAVING_START) ||
+    } else if ((gDriveState == DRIVE_START_PRELOAD) ||
+               (gDriveState == DRIVE_LEAVING_START) ||
                (gDriveState == DRIVE_TRACKING) ||
-               (gDriveState == DRIVE_FINAL_APPROACH)) {
+               (gDriveState == DRIVE_FINAL_APPROACH) ||
+               (gDriveState == DRIVE_FINISH_DECEL)) {
         shownMs = (uint32_t) (gMs - gRunStartMs);
     } else {
         shownMs = 0U;
@@ -574,7 +678,12 @@ static void ball_oled_service(void)
         oled_write_text("Err");
         return;
     }
-    if (telemetry.state == BALL_ROD_ACTIVE) {
+    if (telemetry.practiceActive) {
+        oled_write_text(" 2 ");
+        return;
+    }
+    if ((telemetry.state == BALL_ROD_ACTIVE) ||
+        (telemetry.state == BALL_ROD_HOLD)) {
         append_u32(text, (uint16_t) telemetry.ballX);
         oled_write_text(text);
         return;
@@ -582,11 +691,49 @@ static void ball_oled_service(void)
     oled_write_text("0.0s");
 }
 
+static bool q3_state_active(Q3State state)
+{
+    return (state == Q3_TRIM) ||
+        ((state >= Q3_WAKE) && (state <= Q3_SETTLE)) ||
+        (state == Q3_TIMEOUT_LEVEL);
+}
+
+static void q3_ui_service(void)
+{
+    Q3Telemetry telemetry = Q3_get_telemetry();
+    char text[6];
+
+    if (telemetry.state == Q3_FAULT) {
+        if (elapsed_ms(gFaultLedLastToggleMs, APP_FAULT_LED_TOGGLE_MS)) {
+            gFaultLedLastToggleMs = gMs;
+            DL_GPIO_togglePins(LED_PORT, LED_led_PIN);
+        }
+    } else if (q3_state_active(telemetry.state)) {
+        DL_GPIO_setPins(LED_PORT, LED_led_PIN);
+    } else {
+        DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
+    }
+
+    if (!elapsed_ms(gLastOledUpdateMs, APP_OLED_UPDATE_MS)) {
+        return;
+    }
+    gLastOledUpdateMs = gMs;
+    if (telemetry.state == Q3_FAULT) {
+        oled_write_text("Err");
+    } else if (telemetry.adjustmentUiActive) {
+        oled_write_adjustment(
+            telemetry.trimDirection, telemetry.currentSteps);
+    } else {
+        format_elapsed_time(telemetry.runElapsedMs, text);
+        oled_write_text(text);
+    }
+}
+
 static void ball_led_service(BallRodState state)
 {
     uint32_t toggleMs;
 
-    if (state == BALL_ROD_ACTIVE) {
+    if ((state == BALL_ROD_ACTIVE) || (state == BALL_ROD_HOLD)) {
         DL_GPIO_setPins(LED_PORT, LED_led_PIN);
         return;
     }
@@ -599,18 +746,108 @@ static void ball_led_service(BallRodState state)
     }
 }
 
-static void __attribute__((unused)) ball_static_tick_5ms(void)
+static BallRodTelemetry ball_control_tick_5ms(
+    bool buttonPressed, bool acceptRemoteTarget, uint16_t supervisorFlags)
 {
     BallVisionSample vision;
+    BallTargetCommand targetCommand;
     BallRodTelemetry telemetry;
-    bool buttonPressed =
-        ((DL_GPIO_readPins(KEY_PORT, KEY_key_PIN) & KEY_key_PIN) != 0U) ==
-        (APP_BUTTON_ACTIVE_LEVEL != 0U);
+    BallStatusFrame status;
+    uint16_t flags = supervisorFlags;
+    bool eventPending;
+    bool periodicDue;
 
     ball_protocol_process_5ms(gMs);
+    targetCommand = ball_protocol_get_target_command();
+    if (acceptRemoteTarget && targetCommand.received &&
+        (targetCommand.updateCounter !=
+            gBallLastTargetUpdateCounter)) {
+        gBallLastTargetUpdateCounter =
+            targetCommand.updateCounter;
+        ball_rod_set_target_x_q4(targetCommand.targetXQ4);
+    }
     vision = ball_protocol_get_sample();
     ball_rod_tick_5ms(gMs, buttonPressed, &vision);
     telemetry = ball_rod_get_telemetry();
+
+    eventPending =
+        telemetry.eventCounter != gBallLastEventCounter;
+    periodicDue =
+        elapsed_ms(gBallLastStatusMs, APP_BALL_STATUS_PERIOD_MS);
+    if (eventPending || periodicDue) {
+        if (telemetry.driverEnabled) {
+            flags |= BALL_STATUS_FLAG_DRIVER_ENABLED;
+        }
+        if (telemetry.stepRunning) {
+            flags |= BALL_STATUS_FLAG_STEP_RUNNING;
+        }
+        if (telemetry.visionFresh) {
+            flags |= BALL_STATUS_FLAG_VISION_FRESH;
+        }
+        if (telemetry.centerSettled) {
+            flags |= BALL_STATUS_FLAG_SETTLED;
+        }
+        if (telemetry.mustCorrect) {
+            flags |= BALL_STATUS_FLAG_MUST_CORRECT;
+        }
+        if (telemetry.approachingCenter) {
+            flags |= BALL_STATUS_FLAG_APPROACHING;
+        }
+        if (telemetry.recoveryActive) {
+            flags |= BALL_STATUS_FLAG_RECOVERY;
+        }
+        if (telemetry.limitReached) {
+            flags |= BALL_STATUS_FLAG_AT_LIMIT;
+        }
+        if (telemetry.sequenceTimedOut) {
+            flags |= BALL_STATUS_FLAG_SEQUENCE_LATE;
+        }
+
+        status.runId = telemetry.runId;
+        status.mspMs = gMs;
+        status.state = (uint8_t) telemetry.state;
+        status.motionPhase = (uint8_t) telemetry.motionPhase;
+        status.flags = flags;
+        status.currentSteps = (int16_t) telemetry.currentSteps;
+        status.targetSteps = (int16_t) telemetry.targetSteps;
+        status.errorQ4 = telemetry.ballErrorQ4;
+        status.filteredVelocity = telemetry.filteredVelocity;
+        status.stepHz = telemetry.stepFrequencyHz;
+        status.tiltLimit = telemetry.tiltLimit;
+        status.recoveryPhase = telemetry.recoveryPhase;
+        status.armFrames = telemetry.armFrames;
+        status.targetXQ4 = telemetry.targetXQ4;
+        status.continuousTiltQ8 = telemetry.continuousTiltQ8;
+        status.frictionBoostQ8 = telemetry.frictionBoostQ8;
+        status.visionAgeMs =
+            (telemetry.visionAgeMs > 65535U) ? 65535U :
+            (uint16_t) telemetry.visionAgeMs;
+        status.faultReason = telemetry.faultReason;
+        status.crcErrors = (uint16_t) telemetry.crcErrors;
+        status.sequenceDrops =
+            (uint16_t) telemetry.sequenceDrops;
+        status.rxOverflows = (uint16_t) telemetry.rxOverflows;
+        status.event = eventPending ? telemetry.event :
+            BALL_STATUS_EVENT_NONE;
+        if (ball_protocol_queue_status(&status)) {
+            gBallLastStatusMs = gMs;
+            if (eventPending) {
+                gBallLastEventCounter =
+                    telemetry.eventCounter;
+            }
+        }
+    }
+    return telemetry;
+}
+
+static void __attribute__((unused)) ball_static_tick_5ms(void)
+{
+    bool buttonPressed =
+        ((DL_GPIO_readPins(KEY_PORT, KEY_key_PIN) & KEY_key_PIN) != 0U) ==
+        (APP_BUTTON_ACTIVE_LEVEL != 0U);
+    BallRodTelemetry telemetry =
+        ball_control_tick_5ms(buttonPressed, true, 0U);
+
     ball_led_service(telemetry.state);
     ball_oled_service();
 }
@@ -721,7 +958,7 @@ static uint32_t traveled_counts(void)
     return (distanceA + distanceB) / 2U;
 }
 
-static bool button_pressed_event(void)
+static bool button_release_event(uint32_t *heldMs)
 {
     uint8_t raw = ((DL_GPIO_readPins(KEY_PORT, KEY_key_PIN) &
                        KEY_key_PIN) != 0U) ? 1U : 0U;
@@ -733,13 +970,30 @@ static bool button_pressed_event(void)
     if ((gButtonStable != gButtonRaw) &&
         elapsed_ms(gButtonRawChangedMs, APP_BUTTON_DEBOUNCE_MS)) {
         gButtonStable = gButtonRaw;
-        return gButtonStable == APP_BUTTON_ACTIVE_LEVEL;
+        if (gButtonStable == APP_BUTTON_ACTIVE_LEVEL) {
+            if (gButtonArmed) {
+                gButtonPressActive = true;
+                gButtonPressStartMs = gMs;
+            }
+        } else {
+            if (!gButtonArmed) {
+                gButtonArmed = true;
+                gButtonPressActive = false;
+                return false;
+            }
+            if (gButtonPressActive) {
+                gButtonPressActive = false;
+                *heldMs = (uint32_t) (gMs - gButtonPressStartMs);
+                return true;
+            }
+        }
     }
     return false;
 }
 
 static void enter_fault(void)
 {
+    ball_rod_set_chassis_accel_compensation_steps(0.0f);
     motor_control_brake();
     gDriveState = DRIVE_FAULT;
     gFaultLedLastToggleMs = gMs;
@@ -750,19 +1004,15 @@ static void enter_fault(void)
 static void enter_complete(void)
 {
     gFrozenElapsedMs = (uint32_t) (gMs - gRunStartMs);
+    ball_rod_set_chassis_accel_compensation_steps(0.0f);
     motor_control_brake();
     gDriveState = DRIVE_COMPLETE;
     DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
     gDisplayDirty = true;
 }
 
-static void start_run(void)
+static void reset_drive_controller(void)
 {
-    MotorTelemetry telemetry = motor_control_get_telemetry();
-
-    gStartEncoderA = telemetry.encoderCountA;
-    gStartEncoderB = telemetry.encoderCountB;
-    gRunStartMs = gMs;
     gFrozenElapsedMs = 0U;
     gStartMarkerClearMs = gMs;
     gLineLostStartMs = gMs;
@@ -778,16 +1028,65 @@ static void start_run(void)
     gStartMarkerClearActive = false;
     gLineLostActive = false;
     gFinishArmed = false;
+    gDriveStartPreloadMs = gMs;
+    gDriveMotionStartMs = gMs;
+    gDriveFinishStartMs = gMs;
+}
+
+static void start_drive_motion(void)
+{
+    MotorTelemetry telemetry = motor_control_get_telemetry();
+
+    gStartEncoderA = telemetry.encoderCountA;
+    gStartEncoderB = telemetry.encoderCountB;
+    gStartMarkerClearMs = gMs;
+    gDriveMotionStartMs = gMs;
     gDriveState = DRIVE_LEAVING_START;
     DL_GPIO_setPins(LED_PORT, LED_led_PIN);
     motor_control_start(gMs);
     gDisplayDirty = true;
 }
 
+static void start_run(const DriveProfile *profile, bool finishEnabled)
+{
+    gDriveProfile = profile;
+    gDriveFinishEnabled = finishEnabled;
+    gDriveTimeoutMs = (gAppMode == APP_Q4_BALL_AB) ? 0U : profile->timeoutMs;
+    gRunStartMs = gMs;
+    reset_drive_controller();
+    if (profile->stableSupervisor) {
+        motor_control_brake();
+        gDriveStartPreloadMs = gMs;
+        gDriveState = DRIVE_START_PRELOAD;
+        ball_rod_set_chassis_accel_compensation_steps(
+            APP_Q5_BALL_START_ACCEL_COMP_STEPS);
+        DL_GPIO_setPins(LED_PORT, LED_led_PIN);
+    } else {
+        start_drive_motion();
+    }
+}
+
+static bool question5_start_ball(void)
+{
+    if (ball_rod_start(gMs)) {
+        gQuestion5BallStarted = true;
+        gQuestion5DriveClickCount = 0U;
+        return true;
+    }
+    return false;
+}
+
 static void update_finish_logic(uint8_t lineMask, uint32_t distance,
     uint32_t elapsed)
 {
     bool wideMarker = is_wide_marker(lineMask);
+
+    if (gDriveState == DRIVE_FINISH_DECEL) {
+        if (elapsed_ms(gDriveFinishStartMs, APP_Q5_FINISH_TOTAL_MS)) {
+            enter_complete();
+        }
+        return;
+    }
 
     if (gDriveState == DRIVE_LEAVING_START) {
         if (!wideMarker) {
@@ -807,6 +1106,10 @@ static void update_finish_logic(uint8_t lineMask, uint32_t distance,
         return;
     }
 
+    if (!gDriveFinishEnabled) {
+        return;
+    }
+
     if (!gFinishArmed &&
         (distance >= APP_FINISH_ARM_COUNTS) &&
         (elapsed >= APP_FINISH_ARM_MS)) {
@@ -822,7 +1125,16 @@ static void update_finish_logic(uint8_t lineMask, uint32_t distance,
             gFinishMarkerScans++;
         }
         if (gFinishMarkerScans >= APP_MARKER_CONFIRM_SCANS) {
-            enter_complete();
+            gFinishMarkerScans = 0U;
+            if (gDriveProfile->stableSupervisor) {
+                gDriveFinishStartMs = gMs;
+                gDriveState = DRIVE_FINISH_DECEL;
+                ball_rod_set_chassis_accel_compensation_steps(
+                    APP_Q5_BALL_BRAKE_ACCEL_COMP_STEPS);
+                gDisplayDirty = true;
+            } else {
+                enter_complete();
+            }
         }
     } else {
         gFinishMarkerScans = 0U;
@@ -836,6 +1148,9 @@ static void update_line_control(uint8_t lineMask)
     int32_t targetPwmA;
     int32_t targetPwmB;
     int32_t controlError;
+    uint32_t profileElapsedMs;
+    uint32_t decelDurationMs;
+    bool stallDetectionEnabled = true;
     int16_t lineError = line_error_from_mask(lineMask);
 
     if (lineMask == 0U) {
@@ -858,7 +1173,7 @@ static void update_line_control(uint8_t lineMask)
             (controlError <= APP_TRACK_CENTER_DEADBAND)) {
             controlError = 0;
         }
-        gLinePidCorrection = line_pid_update(controlError);
+        gLinePidCorrection = line_pid_update(controlError, gDriveProfile);
     }
 
     /*
@@ -867,34 +1182,96 @@ static void update_line_control(uint8_t lineMask)
      * searching in the established direction without integral windup.
      */
     basePwm = (gDriveState == DRIVE_FINAL_APPROACH) ?
-        APP_TRACK_FINAL_PWM : APP_TRACK_BASE_PWM;
+        gDriveProfile->finalPwm : gDriveProfile->basePwm;
     correction = gLinePidCorrection;
+
+    if (gDriveProfile->stableSupervisor) {
+        if (gDriveState == DRIVE_FINISH_DECEL) {
+            profileElapsedMs = (uint32_t) (gMs - gDriveFinishStartMs);
+            if (profileElapsedMs < APP_Q5_FINISH_PRELOAD_MS) {
+                basePwm = APP_Q5_FINISH_ALIGN_PWM;
+            } else if (profileElapsedMs >= APP_Q5_FINISH_TOTAL_MS) {
+                basePwm = 0;
+            } else {
+                decelDurationMs = APP_Q5_FINISH_TOTAL_MS -
+                    APP_Q5_FINISH_PRELOAD_MS;
+                basePwm = (int32_t) (((uint32_t) APP_Q5_FINISH_ALIGN_PWM *
+                    (APP_Q5_FINISH_TOTAL_MS - profileElapsedMs)) /
+                    decelDurationMs);
+            }
+            correction = (int32_t) (((int64_t) correction * basePwm) /
+                APP_Q5_FINISH_ALIGN_PWM);
+            stallDetectionEnabled = false;
+        } else {
+            profileElapsedMs = (uint32_t) (gMs - gDriveMotionStartMs);
+            if (profileElapsedMs < APP_Q5_START_ACCEL_MS) {
+                basePwm = (int32_t) (((uint32_t) basePwm *
+                    profileElapsedMs) / APP_Q5_START_ACCEL_MS);
+            } else {
+                ball_rod_set_chassis_accel_compensation_steps(0.0f);
+            }
+        }
+    }
     targetPwmA = clamp_i32(basePwm - correction, 0, 8000);
     targetPwmB = clamp_i32(basePwm + correction, 0, 8000);
 
     gCommandPwmA = (uint16_t) slew_i32((int32_t) gCommandPwmA,
-        targetPwmA, APP_TRACK_PWM_SLEW_PER_TICK);
+        targetPwmA, gDriveProfile->pwmSlewPerTick);
     gCommandPwmB = (uint16_t) slew_i32((int32_t) gCommandPwmB,
-        targetPwmB, APP_TRACK_PWM_SLEW_PER_TICK);
-    motor_control_drive_pwm_5ms(gMs, gCommandPwmA, gCommandPwmB);
+        targetPwmB, gDriveProfile->pwmSlewPerTick);
+    motor_control_drive_pwm_5ms(gMs, gCommandPwmA, gCommandPwmB,
+        stallDetectionEnabled);
     if (motor_control_stalled()) {
+        enter_fault();
+    }
+}
+
+static bool drive_sequence_active(void)
+{
+    return (gDriveState == DRIVE_START_PRELOAD) ||
+        (gDriveState == DRIVE_LEAVING_START) ||
+        (gDriveState == DRIVE_TRACKING) ||
+        (gDriveState == DRIVE_FINAL_APPROACH) ||
+        (gDriveState == DRIVE_FINISH_DECEL);
+}
+
+static bool drive_wheels_running(void)
+{
+    return (gDriveState == DRIVE_LEAVING_START) ||
+        (gDriveState == DRIVE_TRACKING) ||
+        (gDriveState == DRIVE_FINAL_APPROACH) ||
+        (gDriveState == DRIVE_FINISH_DECEL);
+}
+
+static void drive_active_tick(void)
+{
+    uint8_t lineMask;
+    uint32_t distance;
+    uint32_t elapsed;
+
+    lineMask = line_sensor_read_mask();
+    distance = traveled_counts();
+    elapsed = (uint32_t) (gMs - gRunStartMs);
+
+    if (!drive_wheels_running()) {
+        return;
+    }
+
+    update_finish_logic(lineMask, distance, elapsed);
+    if (!drive_wheels_running()) {
+        return;
+    }
+
+    update_line_control(lineMask);
+    if ((gDriveState != DRIVE_FAULT) &&
+        (gDriveTimeoutMs != 0U) &&
+        (elapsed >= gDriveTimeoutMs)) {
         enter_fault();
     }
 }
 
 static void __attribute__((unused)) drive_tick_5ms(void)
 {
-    uint8_t lineMask;
-    uint32_t distance;
-    uint32_t elapsed;
-
-    if (button_pressed_event() &&
-        ((gDriveState == DRIVE_IDLE) ||
-         (gDriveState == DRIVE_COMPLETE) ||
-         (gDriveState == DRIVE_FAULT))) {
-        start_run();
-    }
-
     if ((gDriveState == DRIVE_IDLE) ||
         (gDriveState == DRIVE_COMPLETE)) {
         DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
@@ -909,19 +1286,327 @@ static void __attribute__((unused)) drive_tick_5ms(void)
         return;
     }
 
-    lineMask = line_sensor_read_mask();
-    distance = traveled_counts();
-    elapsed = (uint32_t) (gMs - gRunStartMs);
+    drive_active_tick();
+}
 
-    update_finish_logic(lineMask, distance, elapsed);
-    if (gDriveState == DRIVE_COMPLETE) {
+static void question5_led_service(void)
+{
+    if (gDriveState == DRIVE_FAULT) {
+        if (elapsed_ms(gFaultLedLastToggleMs,
+                APP_FAULT_LED_TOGGLE_MS)) {
+            gFaultLedLastToggleMs = gMs;
+            DL_GPIO_togglePins(LED_PORT, LED_led_PIN);
+        }
         return;
     }
+    if (drive_sequence_active()) {
+        DL_GPIO_setPins(LED_PORT, LED_led_PIN);
+    } else {
+        DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
+    }
+}
 
-    update_line_control(lineMask);
-    if ((gDriveState != DRIVE_FAULT) &&
-        (elapsed >= APP_RUN_TIMEOUT_MS)) {
-        enter_fault();
+static void question5_tick_5ms(void)
+{
+    uint32_t heldMs = 0U;
+    uint16_t supervisorFlags = gTargetSelectionAllowed ?
+        BALL_STATUS_FLAG_TARGET_SELECT :
+        (gTargetLocked ? BALL_STATUS_FLAG_TARGET_LOCKED : 0U);
+    BallRodTelemetry telemetry = ball_control_tick_5ms(
+        false, gTargetSelectionAllowed, supervisorFlags);
+    bool released = button_release_event(&heldMs);
+    bool ballReady = telemetry.visionFresh &&
+        (telemetry.state != BALL_ROD_VISION_FAULT) &&
+        (telemetry.state != BALL_ROD_SAFETY_FAULT);
+
+    /*
+     * Q4 enables a freshly reset UART session when the mode is entered, so
+     * ball_rod_start() cannot succeed in enter_selected_mode(): no post-entry
+     * vision frame exists yet.  Start automatically on the first fresh frame
+     * instead of leaving Q4 permanently unarmed.
+     */
+    if ((gAppMode == APP_Q4_BALL_AB) &&
+        !gQuestion5BallStarted && ballReady) {
+        (void) question5_start_ball();
+    }
+
+    if (released && (heldMs < APP_BUTTON_IGNORE_LONG_MS) &&
+        !drive_sequence_active()) {
+        if (gAppMode == APP_Q4_BALL_AB) {
+            if (gQuestion5BallStarted && ballReady) {
+                start_run(&gQ456DriveProfile, false);
+            }
+        } else if (!gQuestion5BallStarted) {
+            BallTargetCommand target = ball_protocol_get_target_command();
+            if (target.received && ballReady) {
+                ball_rod_set_target_x_q4(target.targetXQ4);
+                if (question5_start_ball()) {
+                    gTargetSelectionAllowed = false;
+                    gTargetLocked = true;
+                }
+            }
+        } else if (gQuestion5DriveClickCount == 0U) {
+            gQuestion5DriveClickCount = 1U;
+            gQuestion5DriveFirstClickMs = gMs;
+        } else if ((uint32_t) (gMs - gQuestion5DriveFirstClickMs) <=
+            APP_Q56_DRIVE_DOUBLE_CLICK_MS) {
+            gQuestion5DriveClickCount = 0U;
+            if (ballReady) {
+                start_run(&gQ456DriveProfile, true);
+            }
+        } else {
+            gQuestion5DriveClickCount = 1U;
+            gQuestion5DriveFirstClickMs = gMs;
+        }
+    }
+
+    if ((gQuestion5DriveClickCount != 0U) &&
+        elapsed_ms(gQuestion5DriveFirstClickMs,
+            APP_Q56_DRIVE_DOUBLE_CLICK_MS)) {
+        gQuestion5DriveClickCount = 0U;
+    }
+
+    if ((gDriveState == DRIVE_START_PRELOAD) &&
+        elapsed_ms(gDriveStartPreloadMs, APP_Q5_START_PRELOAD_MS)) {
+        start_drive_motion();
+    }
+    if (drive_wheels_running()) {
+        drive_active_tick();
+    }
+    question5_led_service();
+}
+
+static void enter_selected_mode(void)
+{
+    gQuestion5DriveClickCount = 0U;
+    gQuestion5BallStarted = false;
+    gTargetSelectionAllowed = false;
+    gTargetLocked = false;
+    gLastOledUpdateMs = (uint32_t) (gMs - APP_OLED_UPDATE_MS);
+
+    if (gMenuItem == 0U) {
+        gAppMode = APP_Q2_TRACK;
+        ball_protocol_set_enabled(false, gMs);
+        start_run(&gQ2DriveProfile, true);
+    } else if (gMenuItem == 1U) {
+        gAppMode = APP_Q3_TRIM;
+        ball_protocol_set_enabled(false, gMs);
+        Q3_init(gMs);
+    } else if (gMenuItem == 2U) {
+        gAppMode = APP_Q4_BALL_AB;
+        ball_protocol_set_enabled(true, gMs);
+        ball_rod_set_target_x_q4(APP_BALL_DEFAULT_TARGET_X_Q4);
+        gTargetLocked = true;
+        /* Started by question5_tick_5ms after the first fresh Q4 frame. */
+    } else {
+        gAppMode = APP_Q56_POS_TRACK;
+        ball_protocol_set_enabled(true, gMs);
+        gTargetSelectionAllowed = true;
+        oled_show_small_message("CONFIRM POS?");
+    }
+}
+
+static void supervisor_menu_tick(void)
+{
+    uint32_t heldMs = 0U;
+
+    if (button_release_event(&heldMs) &&
+        (heldMs < APP_BUTTON_IGNORE_LONG_MS)) {
+        if (gMenuClickPending &&
+            !elapsed_ms(gMenuFirstClickMs, APP_MENU_DOUBLE_CLICK_MS)) {
+            gMenuClickPending = false;
+            enter_selected_mode();
+            return;
+        }
+        gMenuClickPending = true;
+        gMenuFirstClickMs = gMs;
+    }
+    if (gMenuClickPending && elapsed_ms(gMenuFirstClickMs,
+        APP_MENU_DOUBLE_CLICK_MS)) {
+        gMenuClickPending = false;
+        gMenuItem = (uint8_t) ((gMenuItem + 1U) % 4U);
+        gMenuDirty = true;
+    }
+    if (gMenuDirty) {
+        oled_render_menu();
+    }
+}
+
+static void oled_frame_clear(void)
+{
+    for (uint8_t page = 0U; page < OLED_PAGE_COUNT; page++) {
+        for (uint8_t column = 0U; column < OLED_WIDTH_PIXELS; column++) {
+            gOledPixels[page][column] = 0U;
+        }
+    }
+}
+
+static void oled_draw_large_centered(
+    const char *text, uint8_t scale, uint8_t topPixel)
+{
+    uint16_t textWidth = 0U;
+    const char *cursor = text;
+    uint16_t x;
+
+    while (*cursor != '\0') {
+        uint8_t glyphWidth;
+        (void) oled_glyph(*cursor++, &glyphWidth);
+        textWidth += (uint16_t) glyphWidth * scale;
+        if (*cursor != '\0') {
+            textWidth += scale;
+        }
+    }
+    x = (textWidth < OLED_WIDTH_PIXELS) ?
+        (OLED_WIDTH_PIXELS - textWidth) / 2U : 0U;
+
+    while (*text != '\0') {
+        uint8_t glyphWidth;
+        const uint8_t *glyph = oled_glyph(*text++, &glyphWidth);
+
+        for (uint8_t glyphColumn = 0U; glyphColumn < glyphWidth;
+             glyphColumn++) {
+            for (uint8_t xScale = 0U; xScale < scale; xScale++) {
+                uint16_t outputX = x + xScale;
+
+                for (uint8_t glyphRow = 0U;
+                     glyphRow < OLED_FONT_HEIGHT; glyphRow++) {
+                    if ((glyph[glyphColumn] &
+                            (uint8_t) (1U << glyphRow)) != 0U) {
+                        for (uint8_t yScale = 0U; yScale < scale; yScale++) {
+                            uint16_t outputY = topPixel +
+                                glyphRow * scale + yScale;
+                            if ((outputX < OLED_WIDTH_PIXELS) &&
+                                (outputY < OLED_HEIGHT_PIXELS)) {
+                                gOledPixels[outputY / 8U][outputX] |=
+                                    (uint8_t) (1U << (outputY % 8U));
+                            }
+                        }
+                    }
+                }
+            }
+            x += scale;
+        }
+        if (*text != '\0') {
+            x += scale;
+        }
+    }
+}
+
+static void oled_flush_frame(void)
+{
+    for (uint8_t page = 0U; page < OLED_PAGE_COUNT; page++) {
+        oled_set_position(0U, page);
+        for (uint8_t column = 0U; column < OLED_WIDTH_PIXELS; column++) {
+            oled_write_byte(gOledPixels[page][column], true);
+        }
+    }
+}
+
+static void oled_write_adjustment(int8_t direction, int32_t positionSteps)
+{
+    char directionText[5] = {'D', 'I', 'R', '+', '\0'};
+    char positionText[5];
+    uint32_t magnitude;
+
+    if (direction < 0) {
+        directionText[3] = '-';
+    }
+    if (positionSteps < 0) {
+        positionText[0] = '-';
+        magnitude = (uint32_t) -positionSteps;
+    } else {
+        positionText[0] = '+';
+        magnitude = (uint32_t) positionSteps;
+    }
+    if (magnitude > 999U) {
+        magnitude = 999U;
+    }
+    positionText[1] = (char) ('0' + ((magnitude / 100U) % 10U));
+    positionText[2] = (char) ('0' + ((magnitude / 10U) % 10U));
+    positionText[3] = (char) ('0' + (magnitude % 10U));
+    positionText[4] = '\0';
+
+    oled_frame_clear();
+    oled_draw_large_centered(directionText, 2U, 2U);
+    oled_draw_large_centered(positionText, 4U, 31U);
+    oled_flush_frame();
+}
+
+static void oled_show_small_message(const char *message)
+{
+    oled_clear();
+    oled_write_small_line(3U, message);
+}
+
+static void oled_small_message_service(const char *message)
+{
+    if (!elapsed_ms(gLastOledUpdateMs, APP_OLED_UPDATE_MS)) {
+        return;
+    }
+    gLastOledUpdateMs = gMs;
+    oled_show_small_message(message);
+}
+
+static void oled_render_menu(void)
+{
+    static const char *const labels[4] = {"2", "3", "4", "5&6"};
+    char line[8];
+
+    oled_clear();
+    for (uint8_t item = 0U; item < 4U; item++) {
+        char *cursor = line;
+        *cursor++ = (item == gMenuItem) ? '>' : ' ';
+        *cursor++ = ' ';
+        cursor = append_text(cursor, labels[item]);
+        (void) cursor;
+        oled_write_small_line((uint8_t) (item * 2U), line);
+    }
+    gMenuDirty = false;
+}
+
+static void supervisor_tick_5ms(void)
+{
+    if (gAppMode == APP_MENU) {
+        supervisor_menu_tick();
+    } else if (gAppMode == APP_Q2_TRACK) {
+        if (drive_wheels_running()) {
+            drive_active_tick();
+        }
+        question5_led_service();
+        oled_service();
+    } else if (gAppMode == APP_Q3_TRIM) {
+        bool pressed = ((DL_GPIO_readPins(KEY_PORT, KEY_key_PIN) &
+            KEY_key_PIN) != 0U);
+        Q3_tick_5ms(gMs, pressed);
+        q3_ui_service();
+    } else {
+        BallRodTelemetry telemetry;
+
+        question5_tick_5ms();
+        telemetry = ball_rod_get_telemetry();
+        if (drive_sequence_active()) {
+            oled_service();
+        } else if (gTargetSelectionAllowed) {
+            BallTargetCommand target = ball_protocol_get_target_command();
+            if (telemetry.state == BALL_ROD_SAFETY_FAULT) {
+                oled_small_message_service("BALL FAULT");
+            } else if (target.received && telemetry.visionFresh) {
+                oled_small_message_service("CONFIRM POS?");
+            } else {
+                oled_small_message_service("WAIT K230");
+            }
+        } else if (telemetry.state == BALL_ROD_SAFETY_FAULT) {
+            oled_small_message_service("BALL FAULT");
+        } else if ((telemetry.state == BALL_ROD_VISION_FAULT) ||
+            !telemetry.visionFresh) {
+            oled_small_message_service("VISION ERR");
+        } else if ((gAppMode == APP_Q56_POS_TRACK) &&
+            gQuestion5BallStarted &&
+            (gQuestion5DriveClickCount == 0U)) {
+            oled_small_message_service("WAIT BALL");
+        } else {
+            ball_oled_service();
+        }
     }
 }
 
@@ -943,12 +1628,17 @@ static bool take_control_tick(void)
 
 int main(void)
 {
+    /* Keep the generated startup contract identical to the working test3. */
     SYSCFG_DL_init();
+    /* Stage 1 marker: GPIO/system startup completed. */
+    DL_GPIO_setPins(LED_PORT, LED_led_PIN);
+    oled_init();
 #if APP_OPERATION_MODE == APP_OPERATION_MODE_BALL_STATIC
     motor_control_init();
     motor_control_brake();
     DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
     ball_protocol_init();
+    ball_protocol_set_enabled(true, 0U);
     ball_rod_init(0U);
 
     NVIC_ClearPendingIRQ(PWM_BALL_STEP_INST_INT_IRQN);
@@ -959,16 +1649,74 @@ int main(void)
     NVIC_EnableIRQ(TIMER_0_INST_INT_IRQN);
     DL_TimerG_startCounter(TIMER_0_INST);
 
-    oled_init();
     __disable_irq();
     gControlTicksPending = 0U;
     __enable_irq();
     gLastOledUpdateMs = (uint32_t) (0U - APP_OLED_UPDATE_MS);
-    ball_oled_service();
+    gBallLastStatusMs = 0U;
+    gBallLastEventCounter = 0U;
+    gBallLastTargetUpdateCounter = 0U;
 
     while (1) {
         if (take_control_tick()) {
             ball_static_tick_5ms();
+        } else {
+            __WFI();
+        }
+    }
+#elif APP_OPERATION_MODE == APP_OPERATION_MODE_QUESTION5
+    /* Show the menu before any application driver is initialized. */
+    oled_render_menu();
+    line_sensor_init();
+    motor_control_init();
+    motor_control_brake();
+    ball_protocol_init();
+    ball_rod_init(0U);
+
+    /* PB9 remains on in the menu as an unambiguous startup heartbeat. */
+    DL_GPIO_setPins(LED_PORT, LED_led_PIN);
+
+    gButtonRaw = ((DL_GPIO_readPins(KEY_PORT, KEY_key_PIN) &
+                      KEY_key_PIN) != 0U) ? 1U : 0U;
+    gButtonStable = gButtonRaw;
+    gButtonRawChangedMs = 0U;
+    gQuestion5DriveFirstClickMs = 0U;
+    gQuestion5BallStarted = false;
+    gQuestion5DriveClickCount = 0U;
+    gTargetSelectionAllowed = false;
+    gTargetLocked = false;
+    gButtonArmed = gButtonStable != APP_BUTTON_ACTIVE_LEVEL;
+    gButtonPressActive = false;
+    gButtonPressStartMs = 0U;
+    gAppMode = APP_MENU;
+    gMenuItem = 0U;
+    gMenuClickPending = false;
+    gMenuFirstClickMs = 0U;
+    gMenuDirty = true;
+
+    NVIC_ClearPendingIRQ(ENCODERA_INT_IRQN);
+    NVIC_ClearPendingIRQ(ENCODERB_INT_IRQN);
+    NVIC_ClearPendingIRQ(PWM_BALL_STEP_INST_INT_IRQN);
+    NVIC_ClearPendingIRQ(UART_K230_INST_INT_IRQN);
+    NVIC_ClearPendingIRQ(TIMER_0_INST_INT_IRQN);
+    NVIC_EnableIRQ(ENCODERA_INT_IRQN);
+    NVIC_EnableIRQ(ENCODERB_INT_IRQN);
+    NVIC_EnableIRQ(PWM_BALL_STEP_INST_INT_IRQN);
+    NVIC_EnableIRQ(TIMER_0_INST_INT_IRQN);
+    DL_TimerG_startCounter(TIMER_0_INST);
+
+    __disable_irq();
+    gControlTicksPending = 0U;
+    __enable_irq();
+    gLastOledUpdateMs = (uint32_t) (0U - APP_OLED_UPDATE_MS);
+    gBallLastStatusMs = 0U;
+    gBallLastEventCounter = 0U;
+    gBallLastTargetUpdateCounter = 0U;
+    oled_render_menu();
+
+    while (1) {
+        if (take_control_tick()) {
+            supervisor_tick_5ms();
         } else {
             __WFI();
         }
@@ -991,7 +1739,6 @@ int main(void)
     NVIC_EnableIRQ(TIMER_0_INST_INT_IRQN);
     DL_TimerG_startCounter(TIMER_0_INST);
 
-    oled_init();
     __disable_irq();
     gControlTicksPending = 0U;
     __enable_irq();
@@ -1048,5 +1795,9 @@ void UART_K230_INST_IRQHandler(void)
 
 void PWM_BALL_STEP_INST_IRQHandler(void)
 {
-    ball_rod_step_isr();
+    if (gAppMode == APP_Q3_TRIM) {
+        Q3_step_isr();
+    } else {
+        ball_rod_step_isr();
+    }
 }

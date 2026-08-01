@@ -65,20 +65,16 @@
 #define OLED_RENDER_PAGE_COUNT (5U)
 #define OLED_TOP_PIXEL         (12U)
 #define OLED_HALF_CLOCK_CYCLES (CPUCLK_FREQ / 4000000U)
-#define OLED_RESET_LOW_MS      (120U)
-#define OLED_RESET_RELEASE_MS  (120U)
-#define OLED_BOOT_TEST_MS      (300U)
 
 #define LINE_SETTLE_CYCLES \
     ((CPUCLK_FREQ / 1000000U) * APP_LINE_MUX_SETTLE_US)
 
 typedef enum {
     DRIVE_IDLE = 0,
-    DRIVE_START_PRELOAD,
     DRIVE_LEAVING_START,
     DRIVE_TRACKING,
     DRIVE_FINAL_APPROACH,
-    DRIVE_FINISH_DECEL,
+    DRIVE_BRAKING,
     DRIVE_COMPLETE,
     DRIVE_FAULT
 } DriveState;
@@ -86,6 +82,7 @@ typedef enum {
 typedef enum {
     QUESTION5_BUTTON_NONE = 0,
     QUESTION5_BUTTON_SHORT_CLICK,
+    QUESTION5_BUTTON_PRACTICE,
     QUESTION5_BUTTON_GLOBAL_ESTOP
 } Question5ButtonEvent;
 
@@ -109,18 +106,16 @@ static int32_t gLinePidDerivative;
 static int32_t gLinePidCorrection;
 static uint16_t gCommandPwmA;
 static uint16_t gCommandPwmB;
-static uint8_t gFinishMarkerScans;
+static bool gFinishMarkerDetected;
+static uint32_t gFinishMarkerDetectedMs;
 static bool gStartMarkerClearActive;
 static bool gLineLostActive;
 static bool gFinishArmed;
 static bool gDisplayDirty = true;
 static uint32_t gQuestion5DriveFirstClickMs;
 static uint32_t gQuestion5ButtonPressedMs;
-static uint32_t gQuestion5StartPreloadStartMs;
-static uint32_t gQuestion5MotionStartMs;
-static uint32_t gQuestion5FinishStartMs;
 static bool gQuestion5BallStarted;
-static bool gQuestion5DriveClickPending;
+static uint8_t gQuestion5DriveClickCount;
 static bool gQuestion5ButtonLongHandled;
 static bool gQuestion5GlobalEstopLatched;
 
@@ -404,18 +399,9 @@ static char *__attribute__((unused)) append_i32(
 
 static void oled_init(void)
 {
-    /*
-     * SysConfig now holds RST low from the first GPIO initialization.  Set
-     * the software-SPI bus to a defined idle state before releasing reset,
-     * then give the panel controller enough time to start accepting bytes.
-     */
     DL_GPIO_clearPins(DISPLAY_RST_PORT, DISPLAY_RST_PIN);
-    DL_GPIO_clearPins(DISPLAY_DC_PORT, DISPLAY_DC_PIN);
-    DL_GPIO_setPins(DISPLAY_SCL_PORT, DISPLAY_SCL_PIN);
-    DL_GPIO_setPins(DISPLAY_SDA_PORT, DISPLAY_SDA_PIN);
-    wait_ms(OLED_RESET_LOW_MS);
+    wait_ms(300U);
     DL_GPIO_setPins(DISPLAY_RST_PORT, DISPLAY_RST_PIN);
-    wait_ms(OLED_RESET_RELEASE_MS);
 
     oled_command(0xAEU);
     oled_command(0xD5U);
@@ -441,13 +427,8 @@ static void oled_init(void)
     oled_command(0x30U);
     oled_command(0xA4U);
     oled_command(0xA6U);
-    oled_clear();
-
-    /* A short all-pixels-on test makes successful OLED bring-up visible. */
-    oled_command(0xA5U);
     oled_command(0xAFU);
-    wait_ms(OLED_BOOT_TEST_MS);
-    oled_command(0xA4U);
+    oled_clear();
 }
 
 static const uint8_t *oled_glyph(char character, uint8_t *width)
@@ -591,11 +572,10 @@ static void __attribute__((unused)) oled_service(void)
 
     if (gDriveState == DRIVE_COMPLETE) {
         shownMs = gFrozenElapsedMs;
-    } else if ((gDriveState == DRIVE_START_PRELOAD) ||
-               (gDriveState == DRIVE_LEAVING_START) ||
+    } else if ((gDriveState == DRIVE_LEAVING_START) ||
                (gDriveState == DRIVE_TRACKING) ||
                (gDriveState == DRIVE_FINAL_APPROACH) ||
-               (gDriveState == DRIVE_FINISH_DECEL)) {
+               (gDriveState == DRIVE_BRAKING)) {
         shownMs = (uint32_t) (gMs - gRunStartMs);
     } else {
         shownMs = 0U;
@@ -623,6 +603,10 @@ static void ball_oled_service(void)
     if ((telemetry.state == BALL_ROD_VISION_FAULT) ||
         (telemetry.state == BALL_ROD_SAFETY_FAULT)) {
         oled_write_text("Err");
+        return;
+    }
+    if (telemetry.practiceActive) {
+        oled_write_text(" 2 ");
         return;
     }
     if ((telemetry.state == BALL_ROD_ACTIVE) ||
@@ -852,6 +836,18 @@ static bool is_wide_marker(uint8_t mask)
         APP_MARKER_MIN_CONTIGUOUS_CHANNELS;
 }
 
+static uint8_t count_black_channels(uint8_t mask)
+{
+    uint8_t count = 0U;
+
+    for (uint8_t index = 0U; index < 8U; index++) {
+        if ((mask & (uint8_t) (1U << index)) != 0U) {
+            count++;
+        }
+    }
+    return count;
+}
+
 static uint32_t traveled_counts(void)
 {
     MotorTelemetry telemetry = motor_control_get_telemetry();
@@ -896,25 +892,20 @@ static Question5ButtonEvent question5_button_service(void)
             gQuestion5ButtonPressedMs = gMs;
             gQuestion5ButtonLongHandled = false;
         } else if (!gQuestion5ButtonLongHandled) {
+            uint32_t heldMs = (uint32_t)(gMs - gQuestion5ButtonPressedMs);
+            if (heldMs >= APP_BALL_BUTTON_PRACTICE_MS) {
+                gQuestion5ButtonLongHandled = true;
+                return QUESTION5_BUTTON_PRACTICE;
+            }
             return QUESTION5_BUTTON_SHORT_CLICK;
         }
     }
 
-    if ((gButtonStable == APP_BUTTON_ACTIVE_LEVEL) &&
-        !gQuestion5ButtonLongHandled &&
-        elapsed_ms(gQuestion5ButtonPressedMs,
-            APP_BALL_BUTTON_ESTOP_MS)) {
-        gQuestion5ButtonLongHandled = true;
-        return QUESTION5_BUTTON_GLOBAL_ESTOP;
-    }
     return QUESTION5_BUTTON_NONE;
 }
 
 static void enter_fault(void)
 {
-#if APP_OPERATION_MODE == APP_OPERATION_MODE_QUESTION5
-    ball_rod_set_chassis_accel_compensation_steps(0.0f);
-#endif
     motor_control_brake();
     gDriveState = DRIVE_FAULT;
     gFaultLedLastToggleMs = gMs;
@@ -925,12 +916,7 @@ static void enter_fault(void)
 static void enter_complete(void)
 {
     gFrozenElapsedMs = (uint32_t) (gMs - gRunStartMs);
-#if APP_OPERATION_MODE == APP_OPERATION_MODE_QUESTION5
-    ball_rod_set_chassis_accel_compensation_steps(0.0f);
-#endif
-    motor_control_brake();
-    gDriveState = DRIVE_COMPLETE;
-    DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
+    gDriveState = DRIVE_BRAKING;
     gDisplayDirty = true;
 }
 
@@ -947,13 +933,11 @@ static void reset_drive_controller(void)
     gLinePidCorrection = 0;
     gCommandPwmA = 0U;
     gCommandPwmB = 0U;
-    gFinishMarkerScans = 0U;
+    gFinishMarkerDetected = false;
+    gFinishMarkerDetectedMs = 0U;
     gStartMarkerClearActive = false;
     gLineLostActive = false;
     gFinishArmed = false;
-    gQuestion5StartPreloadStartMs = gMs;
-    gQuestion5MotionStartMs = gMs;
-    gQuestion5FinishStartMs = gMs;
 }
 
 static void start_drive_motion(void)
@@ -963,7 +947,6 @@ static void start_drive_motion(void)
     gStartEncoderA = telemetry.encoderCountA;
     gStartEncoderB = telemetry.encoderCountB;
     gStartMarkerClearMs = gMs;
-    gQuestion5MotionStartMs = gMs;
     gDriveState = DRIVE_LEAVING_START;
     DL_GPIO_setPins(LED_PORT, LED_led_PIN);
     motor_control_start(gMs);
@@ -977,36 +960,6 @@ static void start_run(void)
     start_drive_motion();
 }
 
-static bool question5_drive_sequence_active(void)
-{
-    return (gDriveState == DRIVE_START_PRELOAD) ||
-        (gDriveState == DRIVE_LEAVING_START) ||
-        (gDriveState == DRIVE_TRACKING) ||
-        (gDriveState == DRIVE_FINAL_APPROACH) ||
-        (gDriveState == DRIVE_FINISH_DECEL);
-}
-
-static bool question5_wheels_running(void)
-{
-    return (gDriveState == DRIVE_LEAVING_START) ||
-        (gDriveState == DRIVE_TRACKING) ||
-        (gDriveState == DRIVE_FINAL_APPROACH) ||
-        (gDriveState == DRIVE_FINISH_DECEL);
-}
-
-static void question5_begin_drive_sequence(void)
-{
-    motor_control_brake();
-    gRunStartMs = gMs;
-    reset_drive_controller();
-    gQuestion5StartPreloadStartMs = gMs;
-    gDriveState = DRIVE_START_PRELOAD;
-    ball_rod_set_chassis_accel_compensation_steps(
-        APP_Q5_BALL_START_ACCEL_COMP_STEPS);
-    DL_GPIO_setPins(LED_PORT, LED_led_PIN);
-    gDisplayDirty = true;
-}
-
 static void question5_start_ball(void)
 {
     if (gQuestion5GlobalEstopLatched) {
@@ -1014,8 +967,26 @@ static void question5_start_ball(void)
     }
     if (ball_rod_start(gMs)) {
         gQuestion5BallStarted = true;
-        gQuestion5DriveClickPending = false;
+        gQuestion5DriveClickCount = 0U;
     }
+}
+
+static void question5_reset_target_to_red_line(void)
+{
+    ball_rod_set_target_x_q4(APP_BALL_DEFAULT_TARGET_X_Q4);
+    gBallLastTargetUpdateCounter =
+        ball_protocol_get_target_command().updateCounter;
+}
+
+static void question5_start_practice(void)
+{
+    if (gQuestion5GlobalEstopLatched) {
+        return;
+    }
+    if (!gQuestion5BallStarted) {
+        gQuestion5BallStarted = true;
+    }
+    ball_rod_start_practice(gMs);
 }
 
 static void question5_handle_short_click(void)
@@ -1029,22 +1000,24 @@ static void question5_handle_short_click(void)
         question5_start_ball();
         return;
     }
-    if (question5_drive_sequence_active()) {
-        gQuestion5DriveClickPending = false;
-        return;
-    }
-    if (!gQuestion5DriveClickPending) {
-        gQuestion5DriveClickPending = true;
+
+    if (gQuestion5DriveClickCount == 0U) {
+        gQuestion5DriveClickCount = 1U;
         gQuestion5DriveFirstClickMs = gMs;
         return;
     }
 
     clickIntervalMs = (uint32_t) (gMs - gQuestion5DriveFirstClickMs);
-    if (clickIntervalMs <= APP_Q5_DRIVE_DOUBLE_CLICK_MS) {
-        gQuestion5DriveClickPending = false;
-        question5_begin_drive_sequence();
-    } else {
+    if (clickIntervalMs > APP_Q5_DRIVE_DOUBLE_CLICK_MS) {
+        gQuestion5DriveClickCount = 1U;
         gQuestion5DriveFirstClickMs = gMs;
+        return;
+    }
+
+    gQuestion5DriveClickCount++;
+    if (gQuestion5DriveClickCount >= 3U) {
+        gQuestion5DriveClickCount = 0U;
+        start_run();
     }
 }
 
@@ -1052,14 +1025,6 @@ static void update_finish_logic(uint8_t lineMask, uint32_t distance,
     uint32_t elapsed)
 {
     bool wideMarker = is_wide_marker(lineMask);
-
-    if (gDriveState == DRIVE_FINISH_DECEL) {
-        if (elapsed_ms(gQuestion5FinishStartMs,
-                APP_Q5_FINISH_TOTAL_MS)) {
-            enter_complete();
-        }
-        return;
-    }
 
     if (gDriveState == DRIVE_LEAVING_START) {
         if (!wideMarker) {
@@ -1084,25 +1049,22 @@ static void update_finish_logic(uint8_t lineMask, uint32_t distance,
         (elapsed >= APP_FINISH_ARM_MS)) {
         gFinishArmed = true;
     }
-    if ((gDriveState == DRIVE_TRACKING) &&
-        (distance >= APP_FINAL_APPROACH_COUNTS)) {
-        gDriveState = DRIVE_FINAL_APPROACH;
+
+    /*
+     * After the distance/time arm condition is met, detection of >2 black
+     * channels triggers a 1 s deceleration phase followed by a full stop.
+     */
+    if (gFinishArmed && !gFinishMarkerDetected &&
+        (count_black_channels(lineMask) >= APP_FINISH_MARKER_MIN_CHANNELS)) {
+        gFinishMarkerDetected = true;
+        gFinishMarkerDetectedMs = gMs;
     }
 
-    if (gFinishArmed && wideMarker) {
-        if (gFinishMarkerScans < APP_MARKER_CONFIRM_SCANS) {
-            gFinishMarkerScans++;
+    if (gFinishMarkerDetected) {
+        gDriveState = DRIVE_FINAL_APPROACH;
+        if (elapsed_ms(gFinishMarkerDetectedMs, APP_FINISH_POST_MARKER_MS)) {
+            enter_complete();
         }
-        if (gFinishMarkerScans >= APP_MARKER_CONFIRM_SCANS) {
-            gFinishMarkerScans = 0U;
-            gQuestion5FinishStartMs = gMs;
-            gDriveState = DRIVE_FINISH_DECEL;
-            ball_rod_set_chassis_accel_compensation_steps(
-                APP_Q5_BALL_BRAKE_ACCEL_COMP_STEPS);
-            gDisplayDirty = true;
-        }
-    } else {
-        gFinishMarkerScans = 0U;
     }
 }
 
@@ -1113,12 +1075,12 @@ static void update_line_control(uint8_t lineMask)
     int32_t targetPwmA;
     int32_t targetPwmB;
     int32_t controlError;
-#if APP_OPERATION_MODE == APP_OPERATION_MODE_QUESTION5
-    uint32_t profileElapsedMs;
-    uint32_t decelDurationMs;
-#endif
-    bool stallDetectionEnabled;
     int16_t lineError = line_error_from_mask(lineMask);
+
+    if (gDriveState == DRIVE_BRAKING) {
+        motor_control_drive_pwm_5ms(gMs, 0U, 0U);
+        return;
+    }
 
     if (lineMask == 0U) {
         if (!gLineLostActive) {
@@ -1151,35 +1113,6 @@ static void update_line_control(uint8_t lineMask)
     basePwm = (gDriveState == DRIVE_FINAL_APPROACH) ?
         APP_TRACK_FINAL_PWM : APP_TRACK_BASE_PWM;
     correction = gLinePidCorrection;
-    stallDetectionEnabled = true;
-
-#if APP_OPERATION_MODE == APP_OPERATION_MODE_QUESTION5
-    if (gDriveState == DRIVE_FINISH_DECEL) {
-        profileElapsedMs = (uint32_t) (gMs - gQuestion5FinishStartMs);
-        if (profileElapsedMs < APP_Q5_FINISH_PRELOAD_MS) {
-            basePwm = APP_Q5_FINISH_ALIGN_PWM;
-        } else if (profileElapsedMs >= APP_Q5_FINISH_TOTAL_MS) {
-            basePwm = 0;
-        } else {
-            decelDurationMs = APP_Q5_FINISH_TOTAL_MS -
-                APP_Q5_FINISH_PRELOAD_MS;
-            basePwm = (int32_t) (((uint32_t) APP_Q5_FINISH_ALIGN_PWM *
-                (APP_Q5_FINISH_TOTAL_MS - profileElapsedMs)) /
-                decelDurationMs);
-        }
-        correction = (int32_t) (((int64_t) correction * basePwm) /
-            APP_Q5_FINISH_ALIGN_PWM);
-    } else {
-        profileElapsedMs = (uint32_t) (gMs - gQuestion5MotionStartMs);
-        if (profileElapsedMs < APP_Q5_START_ACCEL_MS) {
-            basePwm = (int32_t) (((uint32_t) basePwm * profileElapsedMs) /
-                APP_Q5_START_ACCEL_MS);
-        } else {
-            ball_rod_set_chassis_accel_compensation_steps(0.0f);
-        }
-    }
-#endif
-
     targetPwmA = clamp_i32(basePwm - correction, 0, 8000);
     targetPwmB = clamp_i32(basePwm + correction, 0, 8000);
 
@@ -1187,11 +1120,7 @@ static void update_line_control(uint8_t lineMask)
         targetPwmA, APP_TRACK_PWM_SLEW_PER_TICK);
     gCommandPwmB = (uint16_t) slew_i32((int32_t) gCommandPwmB,
         targetPwmB, APP_TRACK_PWM_SLEW_PER_TICK);
-#if APP_OPERATION_MODE == APP_OPERATION_MODE_QUESTION5
-    stallDetectionEnabled = gDriveState != DRIVE_FINISH_DECEL;
-#endif
-    motor_control_drive_pwm_5ms(gMs, gCommandPwmA, gCommandPwmB,
-        stallDetectionEnabled);
+    motor_control_drive_pwm_5ms(gMs, gCommandPwmA, gCommandPwmB);
     if (motor_control_stalled()) {
         enter_fault();
     }
@@ -1206,6 +1135,22 @@ static void drive_active_tick(uint32_t timeoutMs)
     lineMask = line_sensor_read_mask();
     distance = traveled_counts();
     elapsed = (uint32_t) (gMs - gRunStartMs);
+
+    if (gDriveState == DRIVE_BRAKING) {
+        /*
+         * Keep the drive tick alive for 500 ms after the finish marker so
+         * the line-control layer can issue zero-PWM and the motors coast
+         * down predictably before the final brake.
+         */
+        update_line_control(lineMask);
+        if (elapsed_ms(gFrozenElapsedMs + gRunStartMs, 500U)) {
+            motor_control_brake();
+            gDriveState = DRIVE_COMPLETE;
+            DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
+            gDisplayDirty = true;
+        }
+        return;
+    }
 
     update_finish_logic(lineMask, distance, elapsed);
     if (gDriveState == DRIVE_COMPLETE) {
@@ -1244,6 +1189,14 @@ static void __attribute__((unused)) drive_tick_5ms(void)
     drive_active_tick(APP_RUN_TIMEOUT_MS);
 }
 
+static bool question5_drive_running(void)
+{
+    return (gDriveState == DRIVE_LEAVING_START) ||
+        (gDriveState == DRIVE_TRACKING) ||
+        (gDriveState == DRIVE_FINAL_APPROACH) ||
+        (gDriveState == DRIVE_BRAKING);
+}
+
 static void question5_led_service(void)
 {
     if (gDriveState == DRIVE_FAULT) {
@@ -1254,7 +1207,7 @@ static void question5_led_service(void)
         }
         return;
     }
-    if (question5_drive_sequence_active()) {
+    if (question5_drive_running()) {
         DL_GPIO_setPins(LED_PORT, LED_led_PIN);
     } else {
         DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
@@ -1265,13 +1218,13 @@ static void question5_tick_5ms(void)
 {
     Question5ButtonEvent buttonEvent;
 
-    /* Ball control and K230 target reception always run independently. */
+    /* Ball control runs independently; Q5 button events handled below. */
     (void) ball_control_tick_5ms(false, true);
     buttonEvent = question5_button_service();
 
     if (buttonEvent == QUESTION5_BUTTON_GLOBAL_ESTOP) {
         gQuestion5GlobalEstopLatched = true;
-        gQuestion5DriveClickPending = false;
+        gQuestion5DriveClickCount = 0U;
         ball_rod_emergency_stop();
         enter_fault();
         question5_led_service();
@@ -1280,20 +1233,18 @@ static void question5_tick_5ms(void)
     if (buttonEvent == QUESTION5_BUTTON_SHORT_CLICK) {
         question5_handle_short_click();
     }
+    if (buttonEvent == QUESTION5_BUTTON_PRACTICE) {
+        question5_start_practice();
+    }
 
-    if (gQuestion5DriveClickPending &&
+    if (gQuestion5DriveClickCount > 0U &&
         ((uint32_t) (gMs - gQuestion5DriveFirstClickMs) >
             APP_Q5_DRIVE_DOUBLE_CLICK_MS)) {
-        gQuestion5DriveClickPending = false;
+        gQuestion5DriveClickCount = 0U;
+        question5_reset_target_to_red_line();
     }
 
-    if ((gDriveState == DRIVE_START_PRELOAD) &&
-        elapsed_ms(gQuestion5StartPreloadStartMs,
-            APP_Q5_START_PRELOAD_MS)) {
-        start_drive_motion();
-    }
-
-    if (question5_wheels_running()) {
+    if (question5_drive_running()) {
         drive_active_tick(APP_Q5_RUN_TIMEOUT_MS);
     }
     question5_led_service();
@@ -1318,22 +1269,20 @@ static bool take_control_tick(void)
 int main(void)
 {
     SYSCFG_DL_init();
-
-    /*
-     * SYSCFG_DL_init() must configure the MCU pins first.  Immediately after
-     * that, initialize the OLED before every other application driver so
-     * motor, line-sensor, UART and ball-rod setup cannot disturb its reset or
-     * software-SPI startup sequence.
-     */
-    oled_init();
-    oled_write_text("0.0s");
-
 #if APP_OPERATION_MODE == APP_OPERATION_MODE_BALL_STATIC
     motor_control_init();
     motor_control_brake();
     DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
     ball_protocol_init();
     ball_rod_init(0U);
+
+    /*
+     * Complete the OLED reset and command sequence before any UART, STEP or
+     * control interrupt can split it.  wait_ms() is CPU-clock based, so this
+     * no longer depends on TIMER_0 already running.
+     */
+    oled_init();
+    oled_write_text("0.0s");
 
     NVIC_ClearPendingIRQ(PWM_BALL_STEP_INST_INT_IRQN);
     NVIC_ClearPendingIRQ(UART_K230_INST_INT_IRQN);
@@ -1359,11 +1308,21 @@ int main(void)
         }
     }
 #elif APP_OPERATION_MODE == APP_OPERATION_MODE_QUESTION5
+    /* OLED first — before any other driver can touch GPIOB / GPIOA */
+    wait_ms(300);
+    oled_init();
+    oled_write_text("0.0s");
+
     line_sensor_init();
     motor_control_init();
     motor_control_brake();
     ball_protocol_init();
     ball_rod_init(0U);
+    DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
+
+    /* heartbeat: PB9 on → CPU survived all driver inits */
+    DL_GPIO_setPins(LED_PORT, LED_led_PIN);
+    wait_ms(200);
     DL_GPIO_clearPins(LED_PORT, LED_led_PIN);
 
     gButtonRaw = ((DL_GPIO_readPins(KEY_PORT, KEY_key_PIN) &
@@ -1373,7 +1332,7 @@ int main(void)
     gQuestion5DriveFirstClickMs = 0U;
     gQuestion5ButtonPressedMs = 0U;
     gQuestion5BallStarted = false;
-    gQuestion5DriveClickPending = false;
+    gQuestion5DriveClickCount = 0U;
     gQuestion5ButtonLongHandled =
         gButtonStable == APP_BUTTON_ACTIVE_LEVEL;
     gQuestion5GlobalEstopLatched = false;
@@ -1402,7 +1361,11 @@ int main(void)
     while (1) {
         if (take_control_tick()) {
             question5_tick_5ms();
-            oled_service();
+            if (question5_drive_running()) {
+                oled_service();
+            } else {
+                ball_oled_service();
+            }
         } else {
             __WFI();
         }
@@ -1416,6 +1379,9 @@ int main(void)
                       KEY_key_PIN) != 0U) ? 1U : 0U;
     gButtonStable = gButtonRaw;
     gButtonRawChangedMs = 0U;
+
+    oled_init();
+    oled_write_text("0.0s");
 
     NVIC_ClearPendingIRQ(ENCODERA_INT_IRQN);
     NVIC_ClearPendingIRQ(ENCODERB_INT_IRQN);
