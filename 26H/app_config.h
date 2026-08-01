@@ -23,7 +23,7 @@
  * in PWM ticks per error unit/tick so the controller remains integer-only.
  * The I term is deliberately small and active only near the line center.
  */
-#define APP_Q2_TRACK_BASE_PWM                    (3000U)
+#define APP_Q2_TRACK_BASE_PWM                    (3500U)
 #define APP_Q2_TRACK_FINAL_PWM                   (1800U)
 #define APP_Q2_TRACK_PWM_SLEW_PER_TICK            (200)
 #define APP_Q2_LINE_PID_KP                        (5)
@@ -47,10 +47,8 @@
 /* Retained for the optional encoder-speed PI interface. */
 #define APP_MOTOR_TARGET_MAX_COUNTS            (68U)
 
-#define APP_LINE_LOST_TIMEOUT_MS               (100U)
 #define APP_ENCODER_STALL_TIMEOUT_MS           (300U)
 #define APP_Q2_RUN_TIMEOUT_MS                  (20000U)
-#define APP_Q56_RUN_TIMEOUT_MS                 (30000U)
 
 #define APP_START_MARKER_CLEAR_MS              (50U)
 #define APP_START_MARKER_CLEAR_COUNTS          (300U)
@@ -96,18 +94,13 @@
 #define APP_OPERATION_MODE                     APP_OPERATION_MODE_QUESTION5
 
 /*
- * Stable chassis supervisor used only by questions 4, 5 and 6.  Question 4
- * disables finish detection and timeout at runtime; questions 5/6 keep the
- * 30 s limit and the full finish-deceleration profile.
+ * Stable chassis supervisor used only by questions 4, 5 and 6.  These modes
+ * keep tracking until reset or power-off; only the startup ramp applies.
  */
 #define APP_Q5_BALL_START_ACCEL_COMP_STEPS       (12.0f)
-#define APP_Q5_BALL_BRAKE_ACCEL_COMP_STEPS      (-12.0f)
 #define APP_Q5_BALL_ACCEL_COMP_LIMIT_STEPS        (24.0f)
 #define APP_Q5_START_PRELOAD_MS                   (100U)
 #define APP_Q5_START_ACCEL_MS                     (500U)
-#define APP_Q5_FINISH_TOTAL_MS                   (1000U)
-#define APP_Q5_FINISH_PRELOAD_MS                  (100U)
-#define APP_Q5_FINISH_ALIGN_PWM                  (1800U)
 
 /*
  * Ball rod installation.
